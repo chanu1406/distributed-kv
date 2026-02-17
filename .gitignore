@@ -1,0 +1,18 @@
+# Build output
+build/
+cmake-build-*/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project internals
+CONTEXT.md
+data/
