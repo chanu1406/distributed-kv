@@ -50,6 +50,11 @@ add_library(dkv_core STATIC
     src/storage/storage_engine.cpp
     src/storage/wal.cpp
     src/storage/snapshot.cpp
+    src/network/protocol.cpp
+    src/network/thread_pool.cpp
+    src/network/epoll_poller.cpp
+    src/network/kqueue_poller.cpp
+    src/network/tcp_server.cpp
 )
 
 target_include_directories(dkv_core PUBLIC
@@ -75,6 +80,8 @@ add_executable(dkv_tests
     tests/unit/test_storage_engine.cpp
     tests/unit/test_wal.cpp
     tests/unit/test_snapshot.cpp
+    tests/unit/test_protocol.cpp
+    tests/unit/test_thread_pool.cpp
 )
 
 target_link_libraries(dkv_tests PRIVATE
@@ -84,3 +91,15 @@ target_link_libraries(dkv_tests PRIVATE
 
 include(GoogleTest)
 gtest_discover_tests(dkv_tests)
+
+# ── Integration Tests (TCP server tests — separate binary) ───────────────────
+add_executable(dkv_integration_tests
+    tests/integration/test_tcp_server.cpp
+)
+
+target_link_libraries(dkv_integration_tests PRIVATE
+    dkv_core
+    GTest::gtest_main
+)
+
+gtest_discover_tests(dkv_integration_tests)

@@ -1,6 +1,6 @@
 # distributed-kv
 
-A distributed in-memory key-value store built from scratch in C++20 with zero heavy dependencies. Implements consistent hashing, quorum-based replication, and crash-safe durability using raw POSIX sockets and standard C++ threading.
+A distributed in-memory key-value store built in C++20 with zero heavy runtime or networking framework dependencies. Implements consistent hashing, quorum-based replication, and crash-safe durability using raw POSIX sockets and standard C++ threading.
 
 
 ## Architecture
