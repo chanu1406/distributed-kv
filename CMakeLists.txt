@@ -47,6 +47,9 @@ add_library(dkv_core STATIC
     src/utils/murmurhash3.cpp
     src/utils/crc32.cpp
     src/config/config.cpp
+    src/storage/storage_engine.cpp
+    src/storage/wal.cpp
+    src/storage/snapshot.cpp
 )
 
 target_include_directories(dkv_core PUBLIC
@@ -69,6 +72,9 @@ add_executable(dkv_tests
     tests/unit/test_murmurhash3.cpp
     tests/unit/test_crc32.cpp
     tests/unit/test_config.cpp
+    tests/unit/test_storage_engine.cpp
+    tests/unit/test_wal.cpp
+    tests/unit/test_snapshot.cpp
 )
 
 target_link_libraries(dkv_tests PRIVATE
