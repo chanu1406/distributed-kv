@@ -17,7 +17,7 @@ A distributed in-memory key-value store built in C++20 with zero heavy runtime o
                ▼
 ┌──────────────────────────────────────────────────┐
 │  Coordinator                                     │
-│  Routes keys via consistent hash ring (MurmurHash3│
+│  Routes keys via consistent hash ring(MurmurHash3│
 │  + virtual nodes) to the correct N replicas      │
 └──────────────┬───────────────────────────────────┘
                ▼
