@@ -55,6 +55,9 @@ add_library(dkv_core STATIC
     src/network/epoll_poller.cpp
     src/network/kqueue_poller.cpp
     src/network/tcp_server.cpp
+    src/cluster/hash_ring.cpp
+    src/cluster/cluster_config.cpp
+    src/cluster/connection_pool.cpp
 )
 
 target_include_directories(dkv_core PUBLIC
@@ -82,6 +85,9 @@ add_executable(dkv_tests
     tests/unit/test_snapshot.cpp
     tests/unit/test_protocol.cpp
     tests/unit/test_thread_pool.cpp
+    tests/unit/test_hash_ring.cpp
+    tests/unit/test_cluster_config.cpp
+    tests/unit/test_connection_pool.cpp
 )
 
 target_link_libraries(dkv_tests PRIVATE
