@@ -1,4 +1,5 @@
 #include "network/tcp_server.h"
+#include "cluster/coordinator.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -27,8 +28,15 @@ bool set_nonblocking(int fd) {
 
 // ── Constructor / Destructor ─────────────────────────────────────────────────
 
-TCPServer::TCPServer(StorageEngine& engine, uint16_t port, size_t num_workers)
-    : engine_(engine), port_(port), pool_(num_workers) {}
+TCPServer::TCPServer(StorageEngine& engine, uint16_t port, size_t num_workers,
+                     uint32_t node_id)
+    : engine_(engine), coordinator_(nullptr), node_id_(node_id),
+      port_(port), pool_(num_workers) {}
+
+TCPServer::TCPServer(StorageEngine& engine, Coordinator& coordinator,
+                     uint16_t port, size_t num_workers, uint32_t node_id)
+    : engine_(engine), coordinator_(&coordinator), node_id_(node_id),
+      port_(port), pool_(num_workers) {}
 
 TCPServer::~TCPServer() {
     stop();
@@ -231,6 +239,12 @@ void TCPServer::process_commands(int fd) {
 }
 
 std::string TCPServer::execute_command(const Command& cmd) {
+    // If we have a coordinator, delegate all routing to it
+    if (coordinator_) {
+        return coordinator_->handle_command(cmd);
+    }
+
+    // Local-only mode: execute directly on the storage engine
     auto now = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()
@@ -248,16 +262,21 @@ std::string TCPServer::execute_command(const Command& cmd) {
         }
 
         case CommandType::SET: {
-            Version v{now, 1};  // node_id=1 for now (will come from config in Phase 4)
+            Version v{now, node_id_};
             engine_.set(cmd.key, cmd.value, v);
             return format_ok();
         }
 
         case CommandType::DEL: {
-            Version v{now, 1};
+            Version v{now, node_id_};
             engine_.del(cmd.key, v);
             return format_ok();
         }
+
+        case CommandType::FWD:
+            // FWD is handled by the Coordinator, not directly by TCPServer.
+            // If we get here, we're in local-only mode and FWD is unsupported.
+            return format_error("FWD_NOT_SUPPORTED");
     }
     return format_error("INTERNAL");
 }

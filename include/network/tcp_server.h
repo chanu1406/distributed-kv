@@ -15,6 +15,9 @@
 
 namespace dkv {
 
+// Forward declaration — avoid circular include
+class Coordinator;
+
 /// Per-connection state, owned exclusively by the event loop thread.
 struct Connection {
     int         fd = -1;
@@ -36,11 +39,22 @@ struct PendingResponse {
 ///   - Responses are pushed back via a thread-safe queue + wakeup fd.
 class TCPServer {
 public:
-    /// Construct the server.
-    /// @param engine   Reference to the storage engine (must outlive the server).
-    /// @param port     TCP port to listen on.
+    /// Construct the server (local-only mode).
+    /// @param engine       Reference to the storage engine (must outlive the server).
+    /// @param port         TCP port to listen on.
     /// @param num_workers  Number of worker threads.
-    TCPServer(StorageEngine& engine, uint16_t port, size_t num_workers);
+    /// @param node_id      This node's unique ID (used for LWW versioning).
+    TCPServer(StorageEngine& engine, uint16_t port, size_t num_workers,
+              uint32_t node_id = 1);
+
+    /// Construct the server (cluster mode — routes via coordinator).
+    /// @param engine       Reference to the storage engine (must outlive the server).
+    /// @param coordinator  Reference to the coordinator (must outlive the server).
+    /// @param port         TCP port to listen on.
+    /// @param num_workers  Number of worker threads.
+    /// @param node_id      This node's unique ID.
+    TCPServer(StorageEngine& engine, Coordinator& coordinator,
+              uint16_t port, size_t num_workers, uint32_t node_id);
 
     /// Start the event loop.  Blocks the calling thread until stop() is called.
     void run();
@@ -56,6 +70,8 @@ public:
 
 private:
     StorageEngine&                           engine_;
+    Coordinator*                             coordinator_ = nullptr;
+    uint32_t                                 node_id_;
     uint16_t                                 port_;
     std::unique_ptr<Poller>                  poller_;
     ThreadPool                               pool_;

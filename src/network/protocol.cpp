@@ -142,6 +142,29 @@ ParseResult try_parse(const char* data, size_t len) {
         return {ParseStatus::OK, cmd, total_size, ""};
     }
 
+    // ── FWD (internal forwarding) ────────────────────────────────────────
+    if (cmd_word == "FWD") {
+        cmd.type = CommandType::FWD;
+
+        if (!consume_space(data, frame_end, pos))
+            return make_error("expected space after FWD");
+
+        uint32_t hops = 0;
+        if (!parse_u32(data, frame_end, pos, hops))
+            return make_error("invalid hops_remaining");
+        cmd.hops_remaining = hops;
+
+        if (!consume_space(data, frame_end, pos))
+            return make_error("expected space after hops");
+
+        // Store the rest of the line as an opaque inner command string
+        if (pos >= frame_end)
+            return make_error("missing inner command");
+        cmd.inner_line.assign(data + pos, frame_end - pos);
+
+        return {ParseStatus::OK, cmd, total_size, ""};
+    }
+
     return make_error("unknown command");
 }
 
@@ -165,6 +188,10 @@ std::string format_not_found() {
 
 std::string format_pong() {
     return "+PONG\n";
+}
+
+std::string format_forward(uint32_t hops, const std::string& inner_line) {
+    return "FWD " + std::to_string(hops) + " " + inner_line + "\n";
 }
 
 }  // namespace dkv

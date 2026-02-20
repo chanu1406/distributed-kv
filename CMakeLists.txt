@@ -58,6 +58,7 @@ add_library(dkv_core STATIC
     src/cluster/hash_ring.cpp
     src/cluster/cluster_config.cpp
     src/cluster/connection_pool.cpp
+    src/cluster/coordinator.cpp
 )
 
 target_include_directories(dkv_core PUBLIC
@@ -88,6 +89,7 @@ add_executable(dkv_tests
     tests/unit/test_hash_ring.cpp
     tests/unit/test_cluster_config.cpp
     tests/unit/test_connection_pool.cpp
+    tests/unit/test_coordinator.cpp
 )
 
 target_link_libraries(dkv_tests PRIVATE

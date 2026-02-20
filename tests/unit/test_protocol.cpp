@@ -161,3 +161,74 @@ TEST(Protocol, FormatNotFound) {
 TEST(Protocol, FormatPong) {
     EXPECT_EQ(dkv::format_pong(), "+PONG\n");
 }
+
+// ---------------------------------------------------------------------------
+// FWD protocol
+// ---------------------------------------------------------------------------
+
+TEST(Protocol, ParseFwdWithGetInner) {
+    std::string buf = "FWD 2 GET 3 foo\n";
+    auto result = dkv::try_parse(buf.data(), buf.size());
+
+    EXPECT_EQ(result.status, dkv::ParseStatus::OK);
+    EXPECT_EQ(result.command.type, dkv::CommandType::FWD);
+    EXPECT_EQ(result.command.hops_remaining, 2u);
+    EXPECT_EQ(result.command.inner_line, "GET 3 foo");
+    EXPECT_EQ(result.bytes_consumed, buf.size());
+}
+
+TEST(Protocol, ParseFwdWithSetInner) {
+    std::string buf = "FWD 1 SET 3 key 5 value\n";
+    auto result = dkv::try_parse(buf.data(), buf.size());
+
+    EXPECT_EQ(result.status, dkv::ParseStatus::OK);
+    EXPECT_EQ(result.command.type, dkv::CommandType::FWD);
+    EXPECT_EQ(result.command.hops_remaining, 1u);
+    EXPECT_EQ(result.command.inner_line, "SET 3 key 5 value");
+}
+
+TEST(Protocol, ParseFwdZeroHops) {
+    std::string buf = "FWD 0 GET 3 foo\n";
+    auto result = dkv::try_parse(buf.data(), buf.size());
+
+    EXPECT_EQ(result.status, dkv::ParseStatus::OK);
+    EXPECT_EQ(result.command.hops_remaining, 0u);
+}
+
+TEST(Protocol, FwdErrorMissingHops) {
+    std::string buf = "FWD\n";
+    auto result = dkv::try_parse(buf.data(), buf.size());
+
+    EXPECT_EQ(result.status, dkv::ParseStatus::ERROR);
+}
+
+TEST(Protocol, FwdErrorMissingInner) {
+    std::string buf = "FWD 2\n";
+    auto result = dkv::try_parse(buf.data(), buf.size());
+
+    EXPECT_EQ(result.status, dkv::ParseStatus::ERROR);
+}
+
+TEST(Protocol, FwdErrorMissingInnerAfterSpace) {
+    std::string buf = "FWD 2 \n";
+    auto result = dkv::try_parse(buf.data(), buf.size());
+
+    // Space is consumed, then inner_line is empty (pos >= frame_end)
+    EXPECT_EQ(result.status, dkv::ParseStatus::ERROR);
+}
+
+TEST(Protocol, FormatForward) {
+    std::string result = dkv::format_forward(2, "GET 3 foo");
+    EXPECT_EQ(result, "FWD 2 GET 3 foo\n");
+}
+
+TEST(Protocol, FormatForwardRoundTrip) {
+    // format_forward produces a parseable FWD frame
+    std::string frame = dkv::format_forward(3, "SET 3 bar 5 world");
+    auto parsed = dkv::try_parse(frame.data(), frame.size());
+
+    EXPECT_EQ(parsed.status, dkv::ParseStatus::OK);
+    EXPECT_EQ(parsed.command.type, dkv::CommandType::FWD);
+    EXPECT_EQ(parsed.command.hops_remaining, 3u);
+    EXPECT_EQ(parsed.command.inner_line, "SET 3 bar 5 world");
+}
