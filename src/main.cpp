@@ -4,7 +4,9 @@
 #include "cluster/hash_ring.h"
 #include "config/config.h"
 #include "network/tcp_server.h"
+#include "storage/snapshot.h"
 #include "storage/storage_engine.h"
+#include "storage/wal.h"
 
 #include <csignal>
 #include <iostream>
@@ -62,10 +64,56 @@ int main(int argc, char* argv[]) {
               << " R=" << cfg.read_quorum
               << " N=" << cfg.replication_factor << "\n";
 
-    // Initialize core components
+    // ── Initialize storage engine ───────────────────────────────────────────
     dkv::StorageEngine engine;
+
+    // ── Open WAL and recover from disk ──────────────────────────────────────
+    dkv::WAL wal;
+    if (!wal.open(cfg.wal_dir)) {
+        std::cerr << "[FATAL] Could not open WAL at " << cfg.wal_dir << "\n";
+        return 1;
+    }
+
+    // Load latest snapshot (if any) to fast-forward engine state
+    uint64_t snapshot_seq = 0;
+    auto snap_path = dkv::Snapshot::find_latest(cfg.snapshot_dir);
+    if (snap_path.has_value()) {
+        auto snap_data = dkv::Snapshot::load(*snap_path);
+        if (snap_data.has_value()) {
+            snapshot_seq = snap_data->seq_no;
+            for (const auto& [key, entry] : snap_data->entries) {
+                if (entry.is_tombstone) {
+                    engine.del(key, entry.version);
+                } else {
+                    engine.set(key, entry.value, entry.version);
+                }
+            }
+            std::cout << "[BOOT] Loaded snapshot at seq " << snapshot_seq
+                      << " (" << snap_data->entries.size() << " entries)\n";
+        }
+    }
+
+    // Replay WAL records written after the snapshot
+    auto records = wal.recover();
+    size_t replayed = 0;
+    for (const auto& rec : records) {
+        if (rec.seq_no <= snapshot_seq) continue;  // already in snapshot
+
+        dkv::Version v{rec.timestamp_ms, cfg.node_id};
+        if (rec.op_type == dkv::OpType::SET) {
+            engine.set(rec.key, rec.value, v);
+        } else {
+            engine.del(rec.key, v);
+        }
+        ++replayed;
+    }
+    std::cout << "[BOOT] WAL: " << records.size() << " total records, "
+              << replayed << " replayed after snapshot\n";
+
+    // ── Build coordinator with durability ────────────────────────────────────
     dkv::ConnectionPool conn_pool;
-    dkv::Coordinator coordinator(engine, ring, conn_pool, cfg.node_id);
+    dkv::Coordinator coordinator(engine, ring, conn_pool, cfg.node_id,
+                                 &wal, cfg.snapshot_dir, cfg.snapshot_interval);
 
     // Create TCP server in cluster mode (routes through coordinator)
     dkv::TCPServer server(engine, coordinator, cfg.port,
@@ -77,5 +125,11 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[BOOT] Server running in cluster mode\n";
     server.run();
+
+    // ── Graceful shutdown: flush WAL ─────────────────────────────────────────
+    wal.sync();
+    wal.close();
+    std::cout << "[SHUTDOWN] WAL flushed and closed\n";
+
     return 0;
 }

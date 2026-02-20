@@ -9,8 +9,12 @@
 namespace dkv {
 
 Coordinator::Coordinator(StorageEngine& engine, HashRing& ring,
-                         ConnectionPool& pool, uint32_t node_id)
-    : engine_(engine), ring_(ring), pool_(pool), node_id_(node_id) {}
+                         ConnectionPool& pool, uint32_t node_id,
+                         WAL* wal, const std::string& snapshot_dir,
+                         uint64_t snapshot_interval)
+    : engine_(engine), ring_(ring), pool_(pool), node_id_(node_id),
+      wal_(wal), snapshot_dir_(snapshot_dir),
+      snapshot_interval_(snapshot_interval) {}
 
 std::string Coordinator::handle_command(const Command& cmd) {
     // PING is always handled locally
@@ -71,14 +75,34 @@ std::string Coordinator::execute_local(const Command& cmd) {
         }
 
         case CommandType::SET: {
+            // Write to WAL first (durability), then apply in memory
+            if (wal_) {
+                WalRecord rec;
+                rec.timestamp_ms = now;
+                rec.op_type      = OpType::SET;
+                rec.key           = cmd.key;
+                rec.value         = cmd.value;
+                wal_->append(rec);
+            }
+
             Version v{now, node_id_};
             engine_.set(cmd.key, cmd.value, v);
+            maybe_snapshot();
             return format_ok();
         }
 
         case CommandType::DEL: {
+            if (wal_) {
+                WalRecord rec;
+                rec.timestamp_ms = now;
+                rec.op_type      = OpType::DEL;
+                rec.key           = cmd.key;
+                wal_->append(rec);
+            }
+
             Version v{now, node_id_};
             engine_.del(cmd.key, v);
+            maybe_snapshot();
             return format_ok();
         }
 
@@ -147,6 +171,20 @@ std::string Coordinator::serialize_command_line(const Command& cmd) {
 
         default:
             return "";
+    }
+}
+
+void Coordinator::maybe_snapshot() {
+    if (!wal_ || snapshot_dir_.empty()) return;
+
+    uint64_t ops = ++ops_since_snapshot_;
+    if (ops >= snapshot_interval_) {
+        ops_since_snapshot_ = 0;
+        uint64_t seq = wal_->current_seq_no();
+        wal_->sync();
+        if (Snapshot::save(engine_, seq, snapshot_dir_)) {
+            std::cout << "[SNAP] Snapshot saved at seq " << seq << "\n";
+        }
     }
 }
 
