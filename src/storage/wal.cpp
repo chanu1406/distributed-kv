@@ -44,6 +44,11 @@ uint64_t read_u64(const uint8_t* p) {
 // ── WAL public interface ─────────────────────────────────────────────────────
 
 bool WAL::open(const std::string& directory) {
+    return open(directory, 0, 0);
+}
+
+bool WAL::open(const std::string& directory,
+               uint32_t fsync_interval_ms, uint32_t fsync_batch_ops) {
     std::filesystem::create_directories(directory);
     filepath_ = directory + "/wal.bin";
 
@@ -51,6 +56,15 @@ bool WAL::open(const std::string& directory) {
     if (fd_ < 0) {
         std::cerr << "[WAL] Failed to open " << filepath_ << "\n";
         return false;
+    }
+
+    fsync_interval_ms_ = fsync_interval_ms;
+    fsync_batch_ops_   = fsync_batch_ops;
+
+    // Start the background fsync thread if a timer interval is configured
+    if (fsync_interval_ms_ > 0) {
+        fsync_running_ = true;
+        fsync_thread_ = std::thread(&WAL::fsync_loop, this);
     }
 
     return true;
@@ -64,6 +78,17 @@ uint64_t WAL::append(const WalRecord& record) {
 
     auto buf = serialize(rec);
     ::write(fd_, buf.data(), buf.size());
+    dirty_ = true;
+
+    // Check if we've hit the ops-based fsync threshold
+    if (fsync_batch_ops_ > 0) {
+        uint32_t ops = ++ops_since_sync_;
+        if (ops >= fsync_batch_ops_) {
+            ::fsync(fd_);
+            ops_since_sync_ = 0;
+            dirty_ = false;
+        }
+    }
 
     return rec.seq_no;
 }
@@ -120,10 +145,38 @@ void WAL::sync() {
 }
 
 void WAL::close() {
+    // Stop the background fsync thread first
+    if (fsync_running_.exchange(false)) {
+        fsync_cv_.notify_one();
+        if (fsync_thread_.joinable()) {
+            fsync_thread_.join();
+        }
+    }
+
     if (fd_ >= 0) {
         ::fsync(fd_);
         ::close(fd_);
         fd_ = -1;
+    }
+}
+
+// ── Background fsync ─────────────────────────────────────────────────────────
+
+void WAL::fsync_loop() {
+    while (fsync_running_) {
+        std::unique_lock lock(fsync_mutex_);
+        fsync_cv_.wait_for(lock,
+                           std::chrono::milliseconds(fsync_interval_ms_),
+                           [this] { return !fsync_running_.load(); });
+
+        // Fsync if there are dirty (unsynced) writes
+        if (dirty_.exchange(false)) {
+            std::lock_guard wal_lock(mutex_);
+            if (fd_ >= 0) {
+                ::fsync(fd_);
+                ops_since_sync_ = 0;
+            }
+        }
     }
 }
 

@@ -69,7 +69,7 @@ int main(int argc, char* argv[]) {
 
     // ── Open WAL and recover from disk ──────────────────────────────────────
     dkv::WAL wal;
-    if (!wal.open(cfg.wal_dir)) {
+    if (!wal.open(cfg.wal_dir, cfg.fsync_interval_ms, /*batch_ops=*/100)) {
         std::cerr << "[FATAL] Could not open WAL at " << cfg.wal_dir << "\n";
         return 1;
     }
