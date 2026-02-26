@@ -13,6 +13,14 @@ enum class CommandType : uint8_t {
     DEL,
     PING,
     FWD,        // Internal forwarded request
+
+    // ── Internal replication commands (Phase 5) ──────────────────────────────
+    // These are sent node-to-node during quorum scatter-gather.
+    // Clients never send these; they arrive as top-level frames on inter-node
+    // connections (not wrapped in FWD, since replication doesn't need hop TTL).
+    RSET,       // Replicated SET: carries explicit Version (timestamp_ms + node_id)
+    RDEL,       // Replicated DEL: carries explicit Version
+    RGET,       // Versioned GET: response includes Version for quorum comparison
 };
 
 /// A parsed client request.
@@ -74,5 +82,25 @@ std::string format_pong();
 /// FWD <hops> <inner_command>\n
 /// Wraps an existing command line for inter-node forwarding.
 std::string format_forward(uint32_t hops, const std::string& inner_line);
+
+// ── Phase 5: Replication helpers ─────────────────────────────────────────────
+
+/// $V <val_len> <value> <timestamp_ms> <node_id>\n
+/// Response to an RGET (versioned GET) when the key is found.
+std::string format_versioned_value(const std::string& value,
+                                   uint64_t timestamp_ms, uint32_t node_id);
+
+/// Result of parsing a versioned GET response from a replica.
+struct VersionedGetResult {
+    bool        found        = false;
+    std::string value;
+    uint64_t    timestamp_ms = 0;
+    uint32_t    node_id      = 0;
+};
+
+/// Parse the response returned by a replica to an RGET command.
+/// Handles "$V ..." (found), "-NOT_FOUND\n" (not found), and anything else
+/// (treated as an error / not-found).
+VersionedGetResult parse_versioned_response(const std::string& resp);
 
 }  // namespace dkv

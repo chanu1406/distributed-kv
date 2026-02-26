@@ -110,10 +110,13 @@ int main(int argc, char* argv[]) {
     std::cout << "[BOOT] WAL: " << records.size() << " total records, "
               << replayed << " replayed after snapshot\n";
 
-    // ── Build coordinator with durability ────────────────────────────────────
+    // ── Build coordinator with durability and quorum parameters ─────────────
     dkv::ConnectionPool conn_pool;
     dkv::Coordinator coordinator(engine, ring, conn_pool, cfg.node_id,
-                                 &wal, cfg.snapshot_dir, cfg.snapshot_interval);
+                                 &wal, cfg.snapshot_dir, cfg.snapshot_interval,
+                                 cfg.replication_factor,
+                                 cfg.write_quorum,
+                                 cfg.read_quorum);
 
     // Create TCP server in cluster mode (routes through coordinator)
     dkv::TCPServer server(engine, coordinator, cfg.port,

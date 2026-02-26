@@ -277,6 +277,14 @@ std::string TCPServer::execute_command(const Command& cmd) {
             // FWD is handled by the Coordinator, not directly by TCPServer.
             // If we get here, we're in local-only mode and FWD is unsupported.
             return format_error("FWD_NOT_SUPPORTED");
+
+        case CommandType::RSET:
+        case CommandType::RDEL:
+        case CommandType::RGET:
+            // Replication commands are cluster-mode-only; they are handled by
+            // the Coordinator.  Reaching here means a client sent one in
+            // local-only mode — reject it.
+            return format_error("REPLICATION_CMD_NOT_SUPPORTED");
     }
     return format_error("INTERNAL");
 }

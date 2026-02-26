@@ -232,3 +232,126 @@ TEST(Protocol, FormatForwardRoundTrip) {
     EXPECT_EQ(parsed.command.hops_remaining, 3u);
     EXPECT_EQ(parsed.command.inner_line, "SET 3 bar 5 world");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5: Internal replication commands (RSET / RDEL / RGET)
+// ---------------------------------------------------------------------------
+
+TEST(Protocol, ParseRget) {
+    std::string buf = "RGET 5 mykey\n";
+    auto result = dkv::try_parse(buf.data(), buf.size());
+
+    EXPECT_EQ(result.status, dkv::ParseStatus::OK);
+    EXPECT_EQ(result.command.type, dkv::CommandType::RGET);
+    EXPECT_EQ(result.command.key, "mykey");
+    EXPECT_EQ(result.bytes_consumed, buf.size());
+}
+
+TEST(Protocol, ParseRset) {
+    // RSET <key_len> <key> <val_len> <value> <timestamp_ms> <node_id>
+    std::string buf = "RSET 3 foo 3 bar 1700000000000 42\n";
+    auto result = dkv::try_parse(buf.data(), buf.size());
+
+    EXPECT_EQ(result.status, dkv::ParseStatus::OK);
+    EXPECT_EQ(result.command.type, dkv::CommandType::RSET);
+    EXPECT_EQ(result.command.key, "foo");
+    EXPECT_EQ(result.command.value, "bar");
+    EXPECT_EQ(result.command.timestamp_ms, 1700000000000ULL);
+    EXPECT_EQ(result.command.node_id, 42u);
+    EXPECT_EQ(result.bytes_consumed, buf.size());
+}
+
+TEST(Protocol, ParseRsetSpacesInValue) {
+    std::string buf = "RSET 3 key 11 hello world 1234567890 1\n";
+    auto result = dkv::try_parse(buf.data(), buf.size());
+
+    EXPECT_EQ(result.status, dkv::ParseStatus::OK);
+    EXPECT_EQ(result.command.type, dkv::CommandType::RSET);
+    EXPECT_EQ(result.command.value, "hello world");
+    EXPECT_EQ(result.command.timestamp_ms, 1234567890ULL);
+    EXPECT_EQ(result.command.node_id, 1u);
+}
+
+TEST(Protocol, ParseRdel) {
+    // RDEL <key_len> <key> <timestamp_ms> <node_id>
+    std::string buf = "RDEL 4 gone 9999999999 7\n";
+    auto result = dkv::try_parse(buf.data(), buf.size());
+
+    EXPECT_EQ(result.status, dkv::ParseStatus::OK);
+    EXPECT_EQ(result.command.type, dkv::CommandType::RDEL);
+    EXPECT_EQ(result.command.key, "gone");
+    EXPECT_EQ(result.command.timestamp_ms, 9999999999ULL);
+    EXPECT_EQ(result.command.node_id, 7u);
+    EXPECT_EQ(result.bytes_consumed, buf.size());
+}
+
+TEST(Protocol, ParseRsetMissingVersion) {
+    // Missing timestamp_ms and node_id → parse error
+    std::string buf = "RSET 3 foo 3 bar\n";
+    auto result = dkv::try_parse(buf.data(), buf.size());
+
+    EXPECT_EQ(result.status, dkv::ParseStatus::ERROR);
+}
+
+TEST(Protocol, ParseRdelMissingVersion) {
+    std::string buf = "RDEL 3 key\n";
+    auto result = dkv::try_parse(buf.data(), buf.size());
+
+    EXPECT_EQ(result.status, dkv::ParseStatus::ERROR);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: Versioned response formatting and parsing
+// ---------------------------------------------------------------------------
+
+TEST(Protocol, FormatVersionedValue) {
+    std::string r = dkv::format_versioned_value("hello", 1700000000000ULL, 3);
+    EXPECT_EQ(r, "$V 5 hello 1700000000000 3\n");
+}
+
+TEST(Protocol, FormatVersionedValueEmptyValue) {
+    std::string r = dkv::format_versioned_value("", 0, 1);
+    EXPECT_EQ(r, "$V 0  0 1\n");
+}
+
+TEST(Protocol, ParseVersionedResponseFound) {
+    std::string resp = "$V 5 hello 1700000000000 3\n";
+    auto r = dkv::parse_versioned_response(resp);
+
+    EXPECT_TRUE(r.found);
+    EXPECT_EQ(r.value, "hello");
+    EXPECT_EQ(r.timestamp_ms, 1700000000000ULL);
+    EXPECT_EQ(r.node_id, 3u);
+}
+
+TEST(Protocol, ParseVersionedResponseFoundSpacesInValue) {
+    std::string resp = dkv::format_versioned_value("hello world", 42ULL, 7);
+    auto r = dkv::parse_versioned_response(resp);
+
+    EXPECT_TRUE(r.found);
+    EXPECT_EQ(r.value, "hello world");
+    EXPECT_EQ(r.timestamp_ms, 42ULL);
+    EXPECT_EQ(r.node_id, 7u);
+}
+
+TEST(Protocol, ParseVersionedResponseNotFound) {
+    auto r = dkv::parse_versioned_response("-NOT_FOUND\n");
+    EXPECT_FALSE(r.found);
+}
+
+TEST(Protocol, ParseVersionedResponseError) {
+    // An error or unknown response: treat as not-found
+    auto r = dkv::parse_versioned_response("-ERR QUORUM_FAILED\n");
+    EXPECT_FALSE(r.found);
+}
+
+TEST(Protocol, VersionedValueRoundTrip) {
+    // format then parse
+    std::string resp = dkv::format_versioned_value("myvalue", 999000111ULL, 5);
+    auto r = dkv::parse_versioned_response(resp);
+
+    EXPECT_TRUE(r.found);
+    EXPECT_EQ(r.value, "myvalue");
+    EXPECT_EQ(r.timestamp_ms, 999000111ULL);
+    EXPECT_EQ(r.node_id, 5u);
+}
