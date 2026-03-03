@@ -144,6 +144,77 @@ void WAL::sync() {
     }
 }
 
+void WAL::truncate_before(uint64_t seq) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (fd_ < 0 || seq == 0) return;
+
+    // 1. Read all records from the current WAL file.
+    off_t file_size = ::lseek(fd_, 0, SEEK_END);
+    if (file_size <= 0) return;
+
+    std::vector<uint8_t> data(static_cast<size_t>(file_size));
+    ::lseek(fd_, 0, SEEK_SET);
+    ssize_t bytes_read = ::read(fd_, data.data(), data.size());
+
+    // 2. Collect only records with seq_no > seq.
+    std::vector<WalRecord> keep;
+    if (bytes_read > 0) {
+        size_t offset = 0;
+        while (offset < static_cast<size_t>(bytes_read)) {
+            WalRecord rec;
+            size_t consumed = 0;
+            if (!deserialize(data.data() + offset,
+                             static_cast<size_t>(bytes_read) - offset,
+                             rec, consumed)) {
+                break;
+            }
+            if (rec.seq_no > seq) {
+                keep.push_back(std::move(rec));
+            }
+            offset += consumed;
+        }
+    }
+
+    // 3. Write the kept records to a temp file in the same directory.
+    std::string tmp_path = filepath_ + ".tmp";
+    int tmp_fd = ::open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (tmp_fd < 0) {
+        // Cannot open temp file — leave WAL unchanged.
+        ::lseek(fd_, 0, SEEK_END);
+        std::cerr << "[WAL] truncate_before: cannot open tmp file " << tmp_path << "\n";
+        return;
+    }
+
+    for (const auto& rec : keep) {
+        auto buf = serialize(rec);
+        ::write(tmp_fd, buf.data(), buf.size());
+    }
+
+    // 4. Fsync the temp file so kept records survive a crash.
+    ::fsync(tmp_fd);
+    ::close(tmp_fd);
+
+    // 5. Close the current fd before rename.
+    ::close(fd_);
+    fd_ = -1;
+
+    // 6. Atomic rename: wal.bin.tmp -> wal.bin.
+    //    On POSIX, rename() is atomic: a crash leaves either the old or
+    //    new file intact.
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, filepath_, ec);
+    if (ec) {
+        std::cerr << "[WAL] truncate_before: rename failed: " << ec.message() << "\n";
+    }
+
+    // 7. Reopen in append mode for future writes.
+    fd_ = ::open(filepath_.c_str(), O_RDWR | O_CREAT | O_APPEND, 0644);
+    if (fd_ < 0) {
+        std::cerr << "[WAL] truncate_before: failed to reopen " << filepath_ << "\n";
+    }
+}
+
 void WAL::close() {
     // Stop the background fsync thread first
     if (fsync_running_.exchange(false)) {

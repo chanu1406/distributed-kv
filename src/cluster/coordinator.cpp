@@ -38,6 +38,40 @@ Coordinator::Coordinator(StorageEngine& engine, HashRing& ring,
       hints_(hints_dir) {
     // Recover any hints persisted before a previous coordinator crash.
     hints_.load();
+    // Thread pool for scatter-gather quorum operations.
+    quorum_pool_ = std::make_unique<ThreadPool>(
+        std::max<size_t>(4, static_cast<size_t>(replication_factor_) * 2));
+    // Start the background repair worker.
+    repair_running_ = true;
+    repair_thread_ = std::thread(&Coordinator::repair_worker, this);
+}
+
+Coordinator::~Coordinator() {
+    // Shut down quorum pool first (no new tasks after this point).
+    quorum_pool_.reset();
+    // Then drain and join the repair worker.
+    {
+        std::lock_guard<std::mutex> lock(repair_mutex_);
+        repair_running_ = false;
+    }
+    repair_cv_.notify_one();
+    if (repair_thread_.joinable()) repair_thread_.join();
+}
+
+void Coordinator::repair_worker() {
+    while (true) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(repair_mutex_);
+            repair_cv_.wait(lock, [this]() {
+                return !repair_queue_.empty() || !repair_running_;
+            });
+            if (!repair_running_ && repair_queue_.empty()) return;
+            task = std::move(repair_queue_.front());
+            repair_queue_.pop();
+        }
+        task();
+    }
 }
 
 std::string Coordinator::handle_command(const Command& cmd) {
@@ -192,13 +226,14 @@ std::string Coordinator::quorum_write(const std::string& key,
     // + node_id as tiebreaker, per §5.A of CONTEXT.md).
     const Version version{now_ms(), node_id_};
 
-    // Scatter writes to all N replicas in parallel.
+    // Scatter writes to all N replicas via the shared thread pool.
     std::atomic<int> acks{0};
-    std::vector<std::thread> threads;
-    threads.reserve(replicas.size());
+    std::atomic<int> remaining{static_cast<int>(replicas.size())};
+    std::mutex done_mutex;
+    std::condition_variable done_cv;
 
     for (const auto& replica : replicas) {
-        threads.emplace_back([&, replica]() {
+        bool submitted = quorum_pool_->submit([&, replica]() {
             bool ok = false;
 
             if (replica.node_id == node_id_) {
@@ -226,10 +261,26 @@ std::string Coordinator::quorum_write(const std::string& key,
             }
 
             if (ok) acks.fetch_add(1, std::memory_order_relaxed);
+            if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                done_cv.notify_one();
+            }
         });
+
+        if (!submitted) {
+            // Pool was shut down before we could queue the task — treat as
+            // failed replica so we never deadlock on done_cv.
+            if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                done_cv.notify_one();
+            }
+        }
     }
 
-    for (auto& t : threads) t.join();
+    {
+        std::unique_lock<std::mutex> lock(done_mutex);
+        done_cv.wait(lock, [&]() {
+            return remaining.load(std::memory_order_acquire) == 0;
+        });
+    }
 
     if (acks.load() >= static_cast<int>(write_quorum_)) {
         return format_ok();
@@ -296,12 +347,14 @@ std::string Coordinator::quorum_read(const std::string& key) {
         NodeInfo    replica;
     };
 
+    // Pre-sized: each slot written by exactly one pool worker (no aliasing).
     std::vector<ReadResponse> responses(replicas.size());
-    std::vector<std::thread>  threads;
-    threads.reserve(replicas.size());
+    std::atomic<int> remaining{static_cast<int>(replicas.size())};
+    std::mutex done_mutex;
+    std::condition_variable done_cv;
 
     for (size_t i = 0; i < replicas.size(); ++i) {
-        threads.emplace_back([&, i]() {
+        bool submitted = quorum_pool_->submit([&, i]() {
             const auto& rep = replicas[i];
             auto& resp      = responses[i];
             resp.replica    = rep;
@@ -319,10 +372,27 @@ std::string Coordinator::quorum_read(const std::string& key) {
                 resp.value   = r.value;
                 resp.version = r.version;
             }
+
+            if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                done_cv.notify_one();
+            }
         });
+
+        if (!submitted) {
+            // Pool shut down — leave resp.ok = false (already default) and
+            // decrement so we never deadlock.
+            if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                done_cv.notify_one();
+            }
+        }
     }
 
-    for (auto& t : threads) t.join();
+    {
+        std::unique_lock<std::mutex> lock(done_mutex);
+        done_cv.wait(lock, [&]() {
+            return remaining.load(std::memory_order_acquire) == 0;
+        });
+    }
 
     // Pick the highest-version response (§9.C LWW comparison).
     const ReadResponse* best = nullptr;
@@ -397,19 +467,21 @@ void Coordinator::read_repair_async(const std::string& key,
                                      const std::string& value,
                                      const Version& latest_ver,
                                      std::vector<NodeInfo> stale_replicas) {
-    // Fire-and-forget: launch a detached thread so the client response is not
-    // delayed.  The repair is best-effort (Phase 5 §9.C of CONTEXT.md).
-    std::thread([this, key, value, latest_ver,
-                 stale = std::move(stale_replicas)]() {
-        for (const auto& replica : stale) {
-            if (replica.node_id == node_id_) {
-                engine_.set(key, value, latest_ver);
-            } else {
-                send_replication_write(replica.address, key, value,
-                                       false, latest_ver);
+    {
+        std::lock_guard<std::mutex> lock(repair_mutex_);
+        repair_queue_.emplace([this, key, value, latest_ver,
+                               stale = std::move(stale_replicas)]() {
+            for (const auto& replica : stale) {
+                if (replica.node_id == node_id_) {
+                    engine_.set(key, value, latest_ver);
+                } else {
+                    send_replication_write(replica.address, key, value,
+                                           false, latest_ver);
+                }
             }
-        }
-    }).detach();
+        });
+    }
+    repair_cv_.notify_one();
 }
 
 // ── Phase 4: Legacy FWD forwarding ──────────────────────────────────────────
@@ -487,6 +559,7 @@ void Coordinator::maybe_snapshot() {
         wal_->sync();
         if (Snapshot::save(engine_, seq, snapshot_dir_)) {
             std::cout << "[SNAP] Snapshot saved at seq " << seq << "\n";
+            wal_->truncate_before(seq);
         }
     }
 }

@@ -61,6 +61,11 @@ public:
     /// The current (last assigned) sequence number.
     uint64_t current_seq_no() const { return next_seq_no_ - 1; }
 
+    /// Remove all entries with sequence number <= seq.
+    /// Rewrites the WAL file atomically (write-tmp + rename).
+    /// No-op if seq == 0 or the WAL is not open.
+    void truncate_before(uint64_t seq);
+
     /// Close the WAL file.  Stops the background fsync thread and
     /// performs a final fsync.
     void close();

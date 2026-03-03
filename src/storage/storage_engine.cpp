@@ -51,16 +51,25 @@ bool StorageEngine::del(const std::string& key, const Version& version) {
 
 std::vector<std::pair<std::string, ValueEntry>>
 StorageEngine::all_entries() const {
-    std::vector<std::pair<std::string, ValueEntry>> result;
-
+    // Lock ALL shards in index order before reading any data.
+    // Deterministic acquisition order prevents deadlock; holding all locks
+    // simultaneously means no write can land in any shard between reading
+    // two consecutive shards, giving a consistent point-in-time snapshot.
+    std::vector<std::shared_lock<std::shared_mutex>> locks;
+    locks.reserve(NUM_SHARDS);
     for (const auto& shard : shards_) {
-        std::shared_lock lock(shard.mutex);
+        locks.emplace_back(shard.mutex);
+    }
+
+    std::vector<std::pair<std::string, ValueEntry>> result;
+    for (const auto& shard : shards_) {
         for (const auto& [k, v] : shard.data) {
             result.emplace_back(k, v);
         }
     }
 
     return result;
+    // All 32 shared locks are released here when `locks` goes out of scope.
 }
 
 }  // namespace dkv

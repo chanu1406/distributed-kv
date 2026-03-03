@@ -1,7 +1,9 @@
 #include "cluster/connection_pool.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -80,8 +82,6 @@ int ConnectionPool::connect_to(const std::string& address) {
         return -1;
     }
 
-    apply_timeouts(fd);
-
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(static_cast<uint16_t>(port));
@@ -92,13 +92,52 @@ int ConnectionPool::connect_to(const std::string& address) {
         return -1;
     }
 
-    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
-                  sizeof(addr)) < 0) {
+    // Set non-blocking for connect so the OS TCP handshake timeout (~60-120s)
+    // doesn't block the quorum thread; we enforce our own timeout_ms_ instead.
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    int ret = ::connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
+                        sizeof(addr));
+    if (ret < 0 && errno != EINPROGRESS) {
         std::cerr << "[POOL] connect() to " << address << " failed: "
                   << strerror(errno) << "\n";
         ::close(fd);
         return -1;
     }
+
+    if (ret < 0) {
+        // EINPROGRESS: wait for the connection to complete within timeout_ms_.
+        struct pollfd pfd{};
+        pfd.fd     = fd;
+        pfd.events = POLLOUT;
+
+        int poll_ret = ::poll(&pfd, 1, timeout_ms_);
+        if (poll_ret <= 0) {
+            // Timeout (0) or poll error (<0)
+            std::cerr << "[POOL] connect() to " << address
+                      << (poll_ret == 0 ? " timed out" : " poll error") << "\n";
+            ::close(fd);
+            return -1;
+        }
+
+        // POLLOUT fired — check whether the connection actually succeeded.
+        int sock_err = 0;
+        socklen_t len = sizeof(sock_err);
+        ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &sock_err, &len);
+        if (sock_err != 0) {
+            std::cerr << "[POOL] connect() to " << address << " failed: "
+                      << strerror(sock_err) << "\n";
+            ::close(fd);
+            return -1;
+        }
+    }
+
+    // Restore blocking mode for normal send/recv I/O.
+    ::fcntl(fd, F_SETFL, flags);
+
+    // Apply send/recv timeouts (these do not affect connect).
+    apply_timeouts(fd);
 
     return fd;
 }

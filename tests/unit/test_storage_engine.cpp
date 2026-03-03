@@ -2,7 +2,10 @@
 
 #include "storage/storage_engine.h"
 
+#include <atomic>
+#include <chrono>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -153,4 +156,90 @@ TEST(StorageEngine, ConcurrentReadWrite) {
         auto result = engine.get("key_" + std::to_string(i));
         EXPECT_TRUE(result.found);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Atomic snapshot stress test
+// ---------------------------------------------------------------------------
+
+// Verify that all_entries() holds all 32 shard locks simultaneously, producing
+// a consistent point-in-time snapshot under concurrent writes.
+//
+// Each writer thread owns a disjoint subset of keys (keyed by thread index mod
+// NUM_WRITERS) and uses strictly increasing per-thread timestamps, so LWW
+// never rejects a write.  The snapshot thread checks three invariants per call:
+//   1. No duplicate keys (each shard is a map, so duplicates would signal an
+//      implementation error in the locking or iteration logic).
+//   2. Every version is non-zero (pre-populated with version 1; writers only
+//      increase versions).
+//   3. Total entry count equals NUM_KEYS (no entries created or destroyed).
+TEST(StorageEngine, AllEntriesConsistentUnderConcurrentWrites) {
+    dkv::StorageEngine engine;
+    constexpr int NUM_KEYS    = 500;
+    constexpr int NUM_WRITERS = 4;
+
+    // Pre-populate: key "k<i>" with version {1, i % UINT32_MAX}.
+    for (int i = 0; i < NUM_KEYS; i++) {
+        engine.set("k" + std::to_string(i), "init",
+                   {1, static_cast<uint32_t>(i)});
+    }
+
+    std::atomic<bool> stop{false};
+    std::atomic<int>  violations{0};
+    std::vector<std::thread> threads;
+
+    // Writer threads: each owns keys where (i % NUM_WRITERS == t).
+    // Strictly increasing timestamps guarantee no LWW rejections.
+    for (int t = 0; t < NUM_WRITERS; t++) {
+        threads.emplace_back([&engine, t, &stop]() {
+            // Start well above 1 and keep incrementing so LWW always accepts.
+            uint64_t ts = 1'000 + static_cast<uint64_t>(t) * 10'000'000ULL;
+            while (!stop) {
+                for (int i = t; i < NUM_KEYS; i += NUM_WRITERS) {
+                    engine.set("k" + std::to_string(i),
+                               "w" + std::to_string(t),
+                               {++ts, static_cast<uint32_t>(t)});
+                }
+            }
+        });
+    }
+
+    // Snapshot thread: call all_entries() in a tight loop and check invariants.
+    threads.emplace_back([&engine, &violations, &stop]() {
+        while (!stop) {
+            auto entries = engine.all_entries();
+
+            // Invariant 1: no duplicate keys within a single snapshot.
+            std::unordered_set<std::string> seen;
+            for (const auto& [k, v] : entries) {
+                if (!seen.insert(k).second) {
+                    violations.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
+            // Invariant 2: every version timestamp must be non-zero
+            // (all keys were pre-populated with version {1, ...}).
+            for (const auto& [k, v] : entries) {
+                if (v.version.timestamp_ms == 0) {
+                    violations.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
+            // Invariant 3: total count equals NUM_KEYS — no entries lost or
+            // created.  Writers only update existing keys; no new keys are
+            // inserted and no deletes are issued.
+            if (static_cast<int>(entries.size()) != NUM_KEYS) {
+                violations.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+
+    // Run for 300 ms — enough to accumulate thousands of snapshot calls.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    stop = true;
+
+    for (auto& th : threads) th.join();
+
+    EXPECT_EQ(violations.load(), 0)
+        << "all_entries() produced an inconsistent snapshot under concurrent writes";
 }

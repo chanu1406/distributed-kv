@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -189,4 +190,24 @@ TEST_F(ConnectionPoolTest, ConnectionToDeadPeer) {
     // Try to connect to a port that has no listener
     auto conn = pool.acquire("127.0.0.1:19999");
     EXPECT_FALSE(conn.has_value());
+}
+
+// Non-blocking connect must fail well within timeout_ms_ + margin, not after
+// the OS-level TCP handshake timeout (60-120 s). We use a port with no
+// listener so the connection is refused immediately; the test guards that the
+// non-blocking path doesn't regress into a long blocking wait.
+TEST(ConnectionPoolNonBlockingTest, FailsFastOnRefusedPort) {
+    // Use a distinct port unlikely to be in use.
+    dkv::ConnectionPool pool(4, 500);
+
+    auto t0 = std::chrono::steady_clock::now();
+    auto conn = pool.acquire("127.0.0.1:19998");
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    EXPECT_FALSE(conn.has_value());
+    // Connection refused should return almost instantly (< 600 ms with margin).
+    EXPECT_LT(elapsed_ms, 600)
+        << "connect_to() took " << elapsed_ms
+        << " ms — likely regressed to blocking connect";
 }

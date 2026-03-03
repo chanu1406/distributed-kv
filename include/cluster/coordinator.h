@@ -3,15 +3,21 @@
 #include "cluster/connection_pool.h"
 #include "cluster/hash_ring.h"
 #include "network/protocol.h"
+#include "network/thread_pool.h"
 #include "replication/hint_store.h"
 #include "storage/snapshot.h"
 #include "storage/storage_engine.h"
 #include "storage/wal.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace dkv {
@@ -50,6 +56,8 @@ public:
                 uint32_t read_quorum = 1,
                 const std::string& hints_dir = "");
 
+    ~Coordinator();
+
     /// Handle a command: quorum-scatter for SET/DEL/GET, execute locally for
     /// RSET/RDEL/RGET/FWD, always local for PING.
     std::string handle_command(const Command& cmd);
@@ -83,7 +91,20 @@ private:
     // Hinted handoff store (§9.D of CONTEXT.md)
     HintStore hints_;
 
+    // ── Quorum thread pool (Task 2: replaces per-request thread spawns) ───────
+    std::unique_ptr<ThreadPool> quorum_pool_;
+
     static constexpr uint32_t DEFAULT_HOPS = 2;
+
+    // ── Background repair queue (Task 1: replaces detached thread) ───────────
+    std::queue<std::function<void()>> repair_queue_;
+    std::mutex                        repair_mutex_;
+    std::condition_variable           repair_cv_;
+    std::thread                       repair_thread_;
+    std::atomic<bool>                 repair_running_{false};
+
+    /// Worker function that drains repair_queue_ until repair_running_ = false.
+    void repair_worker();
 
     // ── Quorum operations ────────────────────────────────────────────────────
 
