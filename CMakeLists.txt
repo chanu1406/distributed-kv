@@ -60,6 +60,8 @@ add_library(dkv_core STATIC
     src/cluster/connection_pool.cpp
     src/cluster/coordinator.cpp
     src/replication/hint_store.cpp
+    src/cluster/membership.cpp
+    src/cluster/heartbeat.cpp
 )
 
 target_include_directories(dkv_core PUBLIC
@@ -92,6 +94,7 @@ add_executable(dkv_tests
     tests/unit/test_connection_pool.cpp
     tests/unit/test_coordinator.cpp
     tests/unit/test_hint_store.cpp
+    tests/unit/test_membership.cpp
 )
 
 target_link_libraries(dkv_tests PRIVATE

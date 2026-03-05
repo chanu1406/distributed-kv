@@ -2,6 +2,8 @@
 #include "cluster/connection_pool.h"
 #include "cluster/coordinator.h"
 #include "cluster/hash_ring.h"
+#include "cluster/heartbeat.h"
+#include "cluster/membership.h"
 #include "config/config.h"
 #include "network/tcp_server.h"
 #include "storage/snapshot.h"
@@ -11,10 +13,12 @@
 #include <csignal>
 #include <iostream>
 
-static dkv::TCPServer* g_server = nullptr;
+static dkv::TCPServer*  g_server    = nullptr;
+static dkv::Heartbeat*  g_heartbeat = nullptr;
 
 void signal_handler(int) {
-    if (g_server) g_server->stop();
+    if (g_heartbeat) g_heartbeat->stop();
+    if (g_server)    g_server->stop();
 }
 
 int main(int argc, char* argv[]) {
@@ -118,6 +122,39 @@ int main(int argc, char* argv[]) {
                                  cfg.write_quorum,
                                  cfg.read_quorum);
 
+
+    // Phase 6: Build membership tracker
+    dkv::Membership membership(3, static_cast<int>(cfg.heartbeat_timeout_ms));
+
+    for (const auto& entry : cluster_entries) {
+        uint32_t id = 0;
+        for (char c : entry.name) {
+            if (c >= '0' && c <= '9') id = id * 10 + static_cast<uint32_t>(c - '0');
+        }
+        if (id == 0) id = static_cast<uint32_t>(std::hash<std::string>{}(entry.name) & 0xFFFFFFFF);
+        if (id == cfg.node_id) continue;
+        std::string addr = entry.host + ":" + std::to_string(entry.port);
+        membership.add_peer(id, addr);
+    }
+
+    membership.set_rejoin_callback([&coordinator](uint32_t node_id, const std::string& addr) {
+        std::cout << "[MEMBERSHIP] Node " << node_id << " at " << addr
+                  << " is UP - replaying hints\n";
+        coordinator.replay_hints_for(node_id, addr);
+    });
+
+    membership.set_down_callback([](uint32_t node_id, const std::string& addr) {
+        std::cout << "[MEMBERSHIP] Node " << node_id << " at " << addr << " is DOWN\n";
+    });
+
+    // Phase 6: Start heartbeat
+    dkv::Heartbeat heartbeat(membership, cfg.node_id,
+                             static_cast<int>(cfg.heartbeat_interval_ms), 500);
+    g_heartbeat = &heartbeat;
+    heartbeat.start();
+    std::cout << "[BOOT] Heartbeat started (interval=" << cfg.heartbeat_interval_ms
+              << "ms, timeout=" << cfg.heartbeat_timeout_ms << "ms)\n";
+
     // Create TCP server in cluster mode (routes through coordinator)
     dkv::TCPServer server(engine, coordinator, cfg.port,
                           cfg.worker_threads, cfg.node_id);
@@ -128,6 +165,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[BOOT] Server running in cluster mode\n";
     server.run();
+    heartbeat.stop();
 
     // ── Graceful shutdown: flush WAL ─────────────────────────────────────────
     wal.sync();

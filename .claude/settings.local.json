@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wsl -d Ubuntu -- bash -c \"cd /mnt/c/Users/ochan/OneDrive/Desktop/test/distributedKV && cmake --build build --target dkv_node 2>&1 | tail -20\")",
+      "Bash(python3 -c \":*)"
+    ]
+  }
+}
