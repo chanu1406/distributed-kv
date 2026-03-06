@@ -13,12 +13,12 @@
 #include <csignal>
 #include <iostream>
 
-static dkv::TCPServer*  g_server    = nullptr;
-static dkv::Heartbeat*  g_heartbeat = nullptr;
+static dkv::TCPServer* g_server = nullptr;
 
 void signal_handler(int) {
-    if (g_heartbeat) g_heartbeat->stop();
-    if (g_server)    g_server->stop();
+    // Stop accepting new connections and drain in-flight requests first.
+    // Heartbeat keeps running during drain so membership stays current.
+    if (g_server) g_server->stop();
 }
 
 int main(int argc, char* argv[]) {
@@ -120,7 +120,8 @@ int main(int argc, char* argv[]) {
                                  &wal, cfg.snapshot_dir, cfg.snapshot_interval,
                                  cfg.replication_factor,
                                  cfg.write_quorum,
-                                 cfg.read_quorum);
+                                 cfg.read_quorum,
+                                 cfg.hints_dir);
 
 
     // Phase 6: Build membership tracker
@@ -153,7 +154,6 @@ int main(int argc, char* argv[]) {
     // Phase 6: Start heartbeat
     dkv::Heartbeat heartbeat(membership, cfg.node_id,
                              static_cast<int>(cfg.heartbeat_interval_ms), 500);
-    g_heartbeat = &heartbeat;
     heartbeat.start();
     std::cout << "[BOOT] Heartbeat started (interval=" << cfg.heartbeat_interval_ms
               << "ms, timeout=" << cfg.heartbeat_timeout_ms << "ms)\n";

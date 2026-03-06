@@ -79,6 +79,10 @@ private:
     int                                      wakeup_read_fd_ = -1;
     int                                      wakeup_write_fd_ = -1;
     std::atomic<bool>                        running_{false};
+    std::atomic<bool>                        draining_{false};
+    std::atomic<int>                         in_flight_{0};
+
+    static constexpr int DRAIN_TIMEOUT_MS = 5000;
 
     // Connections owned by the event loop thread
     std::unordered_map<int, Connection>      connections_;

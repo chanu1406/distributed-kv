@@ -218,6 +218,64 @@ TEST_F(TCPIntegrationTest, LargePayload) {
     EXPECT_EQ(resp, expected);
 }
 
+// ── Graceful Shutdown tests ───────────────────────────────────────────────────
+
+TEST_F(TCPIntegrationTest, StopExitsCleanly) {
+    // TearDown already calls stop() + join — this just confirms no hang/crash.
+    // We do one command to make sure the server is alive first.
+    TestClient client;
+    ASSERT_TRUE(client.connect_to(TEST_PORT));
+    ASSERT_TRUE(client.send_data("PING\n"));
+    EXPECT_EQ(client.recv_responses(1), "+PONG\n");
+    // TearDown will stop() + join; the test passes if it doesn't hang.
+}
+
+TEST_F(TCPIntegrationTest, NoNewConnectionsAfterStop) {
+    // Stop the server, then verify new connections are refused.
+    server_->stop();
+    if (server_thread_.joinable()) server_thread_.join();
+
+    // The listen socket is closed after run() returns — new connect should fail.
+    TestClient client;
+    bool connected = client.connect_to(TEST_PORT);
+    EXPECT_FALSE(connected);
+
+    // Prevent TearDown from calling stop() again (already stopped).
+    // Re-create a fresh server so TearDown can stop it cleanly.
+    server_ = std::make_unique<dkv::TCPServer>(engine_, TEST_PORT + 1, 2);
+    server_thread_ = std::thread([this]() { server_->run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+}
+
+TEST_F(TCPIntegrationTest, InFlightRequestCompletesBeforeShutdown) {
+    // Verify that tasks already submitted to the worker pool complete before
+    // the server exits (i.e. drain waits for in_flight_ == 0).
+    TestClient client;
+    ASSERT_TRUE(client.connect_to(TEST_PORT));
+
+    // Send a batch of commands.
+    std::string pipeline;
+    for (int i = 0; i < 10; ++i) pipeline += "PING\n";
+    ASSERT_TRUE(client.send_data(pipeline));
+
+    // Give the event loop enough time to read the TCP data and submit all 10
+    // tasks to the thread pool (so they are "in_flight" when stop() fires).
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Stop now — in_flight_ > 0, so drain will wait for workers to finish.
+    server_->stop();
+
+    // All responses must arrive before the server exits.
+    std::string resp = client.recv_responses(10, 3000);
+    size_t count = 0;
+    size_t pos   = 0;
+    while ((pos = resp.find("+PONG\n", pos)) != std::string::npos) {
+        ++count;
+        pos += 6;
+    }
+    EXPECT_EQ(count, 10u);
+}
+
 TEST_F(TCPIntegrationTest, MultipleClients) {
     TestClient c1, c2;
     ASSERT_TRUE(c1.connect_to(TEST_PORT));

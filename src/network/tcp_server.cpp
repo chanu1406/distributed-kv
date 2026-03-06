@@ -108,12 +108,15 @@ void TCPServer::run() {
     running_ = true;
     std::cout << "[TCP] Listening on port " << port_ << "\n";
 
+    bool drain_started = false;
+    std::chrono::steady_clock::time_point drain_begin;
+
     while (running_) {
         auto events = poller_->poll(100);  // 100ms timeout
 
         for (const auto& ev : events) {
             if (ev.fd == listen_fd_) {
-                handle_accept();
+                if (!draining_.load()) handle_accept();  // no new conns during drain
             } else if (ev.fd == wakeup_read_fd_) {
                 // Drain the wakeup pipe
                 char buf[64];
@@ -132,14 +135,43 @@ void TCPServer::run() {
                 }
             }
         }
+
+        // ── Graceful shutdown drain check (after processing all events) ───────
+        if (draining_.load(std::memory_order_acquire)) {
+            if (!drain_started) {
+                drain_started = true;
+                drain_begin   = std::chrono::steady_clock::now();
+                std::cout << "[TCP] Drain started — no new connections accepted\n";
+            }
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - drain_begin).count();
+            if (in_flight_.load(std::memory_order_acquire) == 0 ||
+                elapsed_ms >= DRAIN_TIMEOUT_MS) {
+                if (elapsed_ms >= DRAIN_TIMEOUT_MS) {
+                    std::cerr << "[TCP] Drain timeout — forcing shutdown\n";
+                }
+                running_ = false;
+            }
+        }
+    }
+
+    // Close the listen socket now so callers can rebind immediately after join()
+    if (listen_fd_ >= 0) {
+        poller_->remove_fd(listen_fd_);
+        ::close(listen_fd_);
+        listen_fd_ = -1;
     }
 }
 
 void TCPServer::stop() {
-    if (!running_.exchange(false)) return;
-    // Wake up the event loop so it exits the poll() call
-    char c = 1;
-    ::write(wakeup_write_fd_, &c, 1);
+    if (draining_.exchange(true)) return;  // already stopping
+    // Wake up the event loop so it starts the drain sequence
+    if (wakeup_write_fd_ >= 0) {
+        char c = 1;
+        ::write(wakeup_write_fd_, &c, 1);
+    } else {
+        running_ = false;  // never started
+    }
 }
 
 // ── Accept ───────────────────────────────────────────────────────────────────
@@ -223,6 +255,9 @@ void TCPServer::process_commands(int fd) {
         Command cmd = std::move(result.command);
         read_buf.erase(0, consumed);
 
+        // Track this task so graceful shutdown can wait for it to finish
+        in_flight_.fetch_add(1, std::memory_order_relaxed);
+
         // Capture fd by value for the worker lambda
         pool_.submit([this, fd, cmd = std::move(cmd)]() {
             std::string response = execute_command(cmd);
@@ -232,6 +267,7 @@ void TCPServer::process_commands(int fd) {
                 std::lock_guard lock(response_mutex_);
                 response_queue_.push_back({fd, std::move(response)});
             }
+            in_flight_.fetch_sub(1, std::memory_order_release);
             char c = 1;
             ::write(wakeup_write_fd_, &c, 1);
         });

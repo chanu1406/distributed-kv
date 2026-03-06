@@ -32,6 +32,9 @@ struct Config {
     // ── Cluster Health ──────────────────────────────────────────────────────
     uint32_t    heartbeat_interval_ms = 1000;
     uint32_t    heartbeat_timeout_ms  = 5000;
+
+    // ── Hinted Handoff ──────────────────────────────────────────────────────
+    std::string hints_dir            = "./data/hints/";
 };
 
 /// Parse command-line arguments into a Config struct.

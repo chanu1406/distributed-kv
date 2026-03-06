@@ -95,6 +95,7 @@ add_executable(dkv_tests
     tests/unit/test_coordinator.cpp
     tests/unit/test_hint_store.cpp
     tests/unit/test_membership.cpp
+    tests/unit/test_heartbeat.cpp
 )
 
 target_link_libraries(dkv_tests PRIVATE
