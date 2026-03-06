@@ -5,6 +5,7 @@
 #include "cluster/coordinator.h"
 #include "cluster/connection_pool.h"
 #include "cluster/hash_ring.h"
+#include "cluster/membership.h"
 #include "network/protocol.h"
 #include "storage/storage_engine.h"
 
@@ -456,6 +457,125 @@ TEST_F(CoordinatorTest, QuorumPoolCleanShutdown) {
         // ~Coordinator(): quorum_pool_.reset() + repair_thread_.join()
     }
     SUCCEED();
+}
+
+// ── Phase 6: Membership-aware quorum ─────────────────────────────────────────
+
+// Helper: drive a peer to DOWN in a Membership object.
+static void drive_to_down(dkv::Membership& m, uint32_t node_id,
+                           int suspect_threshold = 1, int down_ms = 10) {
+    // suspect_threshold failures → SUSPECTED
+    for (int i = 0; i < suspect_threshold; ++i) m.record_failure(node_id);
+    // Wait past down_ms so the SUSPECTED → DOWN transition fires.
+    std::this_thread::sleep_for(std::chrono::milliseconds(down_ms + 10));
+    m.record_failure(node_id);  // triggers DOWN
+}
+
+// With N=2 and W=1, a write succeeds via the local replica even when the
+// remote replica is known-DOWN (no TCP connection attempt is made).
+TEST_F(CoordinatorTest, DownReplicaSkippedInWrite) {
+    ring_.add_node(2, "127.0.0.1:9999", 128);
+
+    // suspect_threshold=1, down_threshold=10ms — fast transitions for tests.
+    dkv::Membership membership(1, 10);
+    membership.add_peer(2, "127.0.0.1:9999");
+    drive_to_down(membership, 2);
+    ASSERT_EQ(membership.get_state(2), dkv::NodeState::DOWN);
+
+    dkv::Coordinator coord(engine_, ring_, pool_, THIS_NODE,
+                           nullptr, "", 100000, /*N=*/2, /*W=*/1, /*R=*/1);
+    coord.set_membership(&membership);
+
+    dkv::Command set_cmd{};
+    set_cmd.type  = dkv::CommandType::SET;
+    set_cmd.key   = "health_key";
+    set_cmd.value = "health_val";
+
+    // Local write satisfies W=1; node 2 is skipped — must return +OK.
+    EXPECT_EQ(coord.handle_command(set_cmd), "+OK\n");
+}
+
+// With R=1, a GET whose primary replica is DOWN returns QUORUM_FAILED
+// immediately (replica skipped without a TCP attempt).
+TEST_F(CoordinatorTest, DownReplicaSkippedInRead) {
+    ring_.add_node(2, "127.0.0.1:9999", 128);
+
+    dkv::Membership membership(1, 10);
+    membership.add_peer(2, "127.0.0.1:9999");
+    drive_to_down(membership, 2);
+    ASSERT_EQ(membership.get_state(2), dkv::NodeState::DOWN);
+
+    dkv::Coordinator coord(engine_, ring_, pool_, THIS_NODE,
+                           nullptr, "", 100000, 2, 1, 1);
+    coord.set_membership(&membership);
+
+    // Find a key whose primary replica (R=1) is the DOWN node 2.
+    std::string down_key;
+    for (int i = 0; i < 2000; ++i) {
+        std::string candidate = "rkey" + std::to_string(i);
+        auto replicas = ring_.get_replica_nodes(candidate, 1);
+        if (!replicas.empty() && replicas[0].node_id == 2) {
+            down_key = candidate;
+            break;
+        }
+    }
+    ASSERT_FALSE(down_key.empty()) << "Could not find a key owned by node 2";
+
+    dkv::Command get_cmd{};
+    get_cmd.type = dkv::CommandType::GET;
+    get_cmd.key  = down_key;
+
+    // Node 2 is skipped → 0 successful reads → QUORUM_FAILED.
+    EXPECT_EQ(coord.handle_command(get_cmd), "-ERR QUORUM_FAILED\n");
+}
+
+// After a DOWN node recovers (record_success), writes attempt it again.
+TEST_F(CoordinatorTest, RecoveredReplicaParticipatesAgain) {
+    ring_.add_node(2, "127.0.0.1:9999", 128);
+
+    dkv::Membership membership(1, 10);
+    membership.add_peer(2, "127.0.0.1:9999");
+    drive_to_down(membership, 2);
+    ASSERT_EQ(membership.get_state(2), dkv::NodeState::DOWN);
+
+    dkv::Coordinator coord(engine_, ring_, pool_, THIS_NODE,
+                           nullptr, "", 100000, 2, 1, 1);
+    coord.set_membership(&membership);
+
+    dkv::Command set_cmd{};
+    set_cmd.type  = dkv::CommandType::SET;
+    set_cmd.key   = "recovery_key";
+    set_cmd.value = "v";
+    EXPECT_EQ(coord.handle_command(set_cmd), "+OK\n");
+
+    // Simulate node 2 rejoining.
+    membership.record_success(2);
+    EXPECT_EQ(membership.get_state(2), dkv::NodeState::UP);
+
+    // Next write will try node 2 (ECONNREFUSED — not listening), but W=1 from
+    // local node still satisfies the quorum.
+    dkv::Command set_cmd2{};
+    set_cmd2.type  = dkv::CommandType::SET;
+    set_cmd2.key   = "recovery_key2";
+    set_cmd2.value = "v2";
+    EXPECT_EQ(coord.handle_command(set_cmd2), "+OK\n");
+}
+
+// Coordinator with no membership set must behave identically to before Phase 6.
+TEST_F(CoordinatorTest, NoMembershipNoRegression) {
+    dkv::Coordinator coord(engine_, ring_, pool_, THIS_NODE,
+                           nullptr, "", 100000, 1, 1, 1);
+
+    dkv::Command set_cmd{};
+    set_cmd.type  = dkv::CommandType::SET;
+    set_cmd.key   = "plain_key";
+    set_cmd.value = "plain_val";
+    EXPECT_EQ(coord.handle_command(set_cmd), "+OK\n");
+
+    dkv::Command get_cmd{};
+    get_cmd.type = dkv::CommandType::GET;
+    get_cmd.key  = "plain_key";
+    EXPECT_EQ(coord.handle_command(get_cmd), "$9 plain_val\n");
 }
 
 // ── Serialize command line (via FWD round-trip) ──────────────────────────────

@@ -233,6 +233,21 @@ std::string Coordinator::quorum_write(const std::string& key,
     std::condition_variable done_cv;
 
     for (const auto& replica : replicas) {
+        // Phase 6: fast-path for known-DOWN remote replicas — skip the TCP
+        // attempt entirely and store a hint immediately (§9.D).
+        if (replica.node_id != node_id_ &&
+            membership_ &&
+            !membership_->is_available(replica.node_id)) {
+            hints_.store(Hint{
+                replica.address, replica.node_id,
+                key, value, is_del, version
+            });
+            if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                done_cv.notify_one();
+            }
+            continue;
+        }
+
         bool submitted = quorum_pool_->submit([&, replica]() {
             bool ok = false;
 
@@ -250,8 +265,8 @@ std::string Coordinator::quorum_write(const std::string& key,
                 ok = send_replication_write(replica.address, key, value,
                                             is_del, version);
                 // §9.D: if the replica is down, store a hint so we can
-                // replay once it comes back UP (Phase 6 will call
-                // replay_hints_for() via the heartbeat handler).
+                // replay once it comes back UP (Membership rejoin callback
+                // triggers replay_hints_for()).
                 if (!ok) {
                     hints_.store(Hint{
                         replica.address, replica.node_id,
@@ -354,19 +369,32 @@ std::string Coordinator::quorum_read(const std::string& key) {
     std::condition_variable done_cv;
 
     for (size_t i = 0; i < replicas.size(); ++i) {
-        bool submitted = quorum_pool_->submit([&, i]() {
-            const auto& rep = replicas[i];
-            auto& resp      = responses[i];
-            resp.replica    = rep;
+        const auto& rep = replicas[i];
 
-            if (rep.node_id == node_id_) {
+        // Phase 6: fast-path for known-DOWN remote replicas — leave
+        // responses[i].ok = false (default) so it counts as a failed read.
+        if (rep.node_id != node_id_ &&
+            membership_ &&
+            !membership_->is_available(rep.node_id)) {
+            if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                done_cv.notify_one();
+            }
+            continue;
+        }
+
+        bool submitted = quorum_pool_->submit([&, i]() {
+            const auto& r2 = replicas[i];
+            auto& resp     = responses[i];
+            resp.replica   = r2;
+
+            if (r2.node_id == node_id_) {
                 resp.ok = true;
                 auto r  = engine_.get(key);
                 resp.found   = r.found;
                 resp.value   = r.value;
                 resp.version = r.version;
             } else {
-                auto r       = send_replication_read(rep.address, key);
+                auto r       = send_replication_read(r2.address, key);
                 resp.ok      = r.ok;
                 resp.found   = r.found;
                 resp.value   = r.value;
@@ -562,6 +590,12 @@ void Coordinator::maybe_snapshot() {
             wal_->truncate_before(seq);
         }
     }
+}
+
+// ── Phase 6: Membership registration ────────────────────────────────────────
+
+void Coordinator::set_membership(Membership* membership) {
+    membership_ = membership;
 }
 
 // ── Phase 5: Hinted handoff replay ──────────────────────────────────────────

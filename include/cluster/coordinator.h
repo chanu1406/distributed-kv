@@ -2,6 +2,7 @@
 
 #include "cluster/connection_pool.h"
 #include "cluster/hash_ring.h"
+#include "cluster/membership.h"
 #include "network/protocol.h"
 #include "network/thread_pool.h"
 #include "replication/hint_store.h"
@@ -67,6 +68,13 @@ public:
     void replay_hints_for(uint32_t target_node_id,
                           const std::string& target_address);
 
+    /// Register the cluster membership tracker.  When set, quorum_write will
+    /// immediately store a hint (no TCP attempt) for DOWN replicas, and
+    /// quorum_read will skip DOWN replicas rather than timing out on them.
+    /// Safe to call before the first command arrives.  Raw pointer — the
+    /// Membership object is owned by main() and outlives the coordinator.
+    void set_membership(Membership* membership);
+
     // Non-copyable
     Coordinator(const Coordinator&) = delete;
     Coordinator& operator=(const Coordinator&) = delete;
@@ -90,6 +98,9 @@ private:
 
     // Hinted handoff store (§9.D of CONTEXT.md)
     HintStore hints_;
+
+    // Optional Phase-6 membership tracker (nullptr = no DOWN-node awareness).
+    Membership* membership_ = nullptr;
 
     // ── Quorum thread pool (Task 2: replaces per-request thread spawns) ───────
     std::unique_ptr<ThreadPool> quorum_pool_;

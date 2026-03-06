@@ -147,6 +147,9 @@ int main(int argc, char* argv[]) {
         std::cout << "[MEMBERSHIP] Node " << node_id << " at " << addr << " is DOWN\n";
     });
 
+    // Wire membership into coordinator so DOWN nodes are skipped in quorum ops.
+    coordinator.set_membership(&membership);
+
     // Phase 6: Start heartbeat
     dkv::Heartbeat heartbeat(membership, cfg.node_id,
                              static_cast<int>(cfg.heartbeat_interval_ms), 500);
