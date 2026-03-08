@@ -85,32 +85,50 @@ cd build
 ctest --output-on-failure
 ```
 
-Currently **33 tests** covering:
+Currently **154+ tests** across 16 test files covering all components:
 
 | Component | Tests |
 |-----------|-------|
-| MurmurHash3 | 6 |
+| MurmurHash3 | 7 |
 | CRC32 | 5 |
 | Config | 5 |
-| Storage Engine | 9 |
-| Write-Ahead Log | 5 |
+| Logger | 11 |
+| Storage Engine | 11 |
+| Write-Ahead Log | 16 |
 | Snapshots | 3 |
+| Protocol | 30+ |
+| Thread Pool | 5 |
+| Hash Ring | 6 |
+| Cluster Config | 5 |
+| Connection Pool | 6 |
+| Coordinator | 14+ |
+| Membership | 10 |
+| Heartbeat | 6 |
+| Hint Store | 13 |
+| TCP Server (integration) | 6 |
 
 ## Project Structure
 
 ```
 include/
+├── cluster/       HashRing, Coordinator, Membership, Heartbeat, ConnectionPool, ClusterConfig
 ├── config/        Config struct and CLI parsing
+├── network/       Poller (epoll/kqueue), TCPServer, ThreadPool, Protocol
+├── replication/   HintStore
 ├── storage/       StorageEngine, WAL, Snapshot headers
-├── utils/         MurmurHash3, CRC32
+├── utils/         MurmurHash3, CRC32, Logger
 src/
+├── cluster/       Hash ring, coordinator, membership, heartbeat, connection pool
 ├── config/        Configuration parsing implementation
+├── network/       Event loop, TCP server, protocol parser, thread pool
+├── replication/   Hinted handoff persistence
 ├── storage/       Storage engine, WAL, snapshots
-├── network/       Event loop, TCP server (Phase 2)
-├── cluster/       Hash ring, coordinator (Phase 2)
-└── replication/   Quorum handler, read repair (Phase 3)
+├── utils/         MurmurHash3, CRC32, logger
 tests/
-└── unit/          Google Test suites for all components
+├── unit/          Google Test suites for all components
+└── integration/   TCP server integration tests
+bench/
+└── bench_storage.cpp  Storage engine microbenchmarks
 ```
 
 ## License
