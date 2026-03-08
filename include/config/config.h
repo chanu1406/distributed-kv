@@ -35,6 +35,9 @@ struct Config {
 
     // ── Hinted Handoff ──────────────────────────────────────────────────────
     std::string hints_dir            = "./data/hints/";
+
+    // ── Logging ─────────────────────────────────────────────────────────────
+    std::string log_level            = "INFO";   // DEBUG|INFO|WARN|ERROR|FATAL
 };
 
 /// Parse command-line arguments into a Config struct.

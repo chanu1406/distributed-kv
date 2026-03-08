@@ -44,6 +44,8 @@ Config parse_args(int argc, char* argv[]) {
             cfg.heartbeat_timeout_ms = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (match("--hints-dir")) {
             cfg.hints_dir = argv[++i];
+        } else if (match("--log-level")) {
+            cfg.log_level = argv[++i];
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::cout << "Usage: dkv_node [OPTIONS]\n\n"
                       << "Options:\n"
@@ -62,6 +64,7 @@ Config parse_args(int argc, char* argv[]) {
                       << "  --heartbeat-interval-ms <MS> Heartbeat period (default: 1000)\n"
                       << "  --heartbeat-timeout-ms <MS>  Down detection timeout (default: 5000)\n"
                       << "  --hints-dir <PATH>           Hinted handoff directory (default: ./data/hints/)\n"
+                      << "  --log-level <LEVEL>          Log level: DEBUG|INFO|WARN|ERROR|FATAL (default: INFO)\n"
                       << "  -h, --help                   Show this help\n";
             std::exit(0);
         } else {
@@ -91,6 +94,7 @@ void print_config(const Config& cfg) {
               << "│  Heartbeat Interval:   " << cfg.heartbeat_interval_ms << " ms\n"
               << "│  Heartbeat Timeout:    " << cfg.heartbeat_timeout_ms << " ms\n"
               << "│  Hints Directory:      " << cfg.hints_dir << "\n"
+              << "│  Log Level:            " << cfg.log_level << "\n"
               << "└──────────────────────────────────────────┘\n";
 }
 

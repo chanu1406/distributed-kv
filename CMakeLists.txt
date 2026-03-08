@@ -46,6 +46,7 @@ enable_testing()
 add_library(dkv_core STATIC
     src/utils/murmurhash3.cpp
     src/utils/crc32.cpp
+    src/utils/logger.cpp
     src/config/config.cpp
     src/storage/storage_engine.cpp
     src/storage/wal.cpp
@@ -96,6 +97,7 @@ add_executable(dkv_tests
     tests/unit/test_hint_store.cpp
     tests/unit/test_membership.cpp
     tests/unit/test_heartbeat.cpp
+    tests/unit/test_logger.cpp
 )
 
 target_link_libraries(dkv_tests PRIVATE
@@ -105,6 +107,12 @@ target_link_libraries(dkv_tests PRIVATE
 
 include(GoogleTest)
 gtest_discover_tests(dkv_tests)
+
+# ── Benchmarks ───────────────────────────────────────────────────────────────
+add_executable(bench_storage
+    bench/bench_storage.cpp
+)
+target_link_libraries(bench_storage PRIVATE dkv_core)
 
 # ── Integration Tests (TCP server tests — separate binary) ───────────────────
 add_executable(dkv_integration_tests

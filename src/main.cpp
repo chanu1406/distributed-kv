@@ -10,6 +10,8 @@
 #include "storage/storage_engine.h"
 #include "storage/wal.h"
 
+#include "utils/logger.h"
+
 #include <csignal>
 #include <iostream>
 
@@ -23,20 +25,25 @@ void signal_handler(int) {
 
 int main(int argc, char* argv[]) {
     dkv::Config cfg = dkv::parse_args(argc, argv);
+
+    // Initialize logger before anything else
+    dkv::Logger::instance().set_level(dkv::parse_log_level(cfg.log_level));
+    dkv::Logger::instance().set_stream(&std::cout);
+
     dkv::print_config(cfg);
 
     // validate quorum invariant: W + R > N
     if (cfg.write_quorum + cfg.read_quorum <= cfg.replication_factor) {
-        std::cerr << "[ERROR] Quorum invariant violated: W(" << cfg.write_quorum
+        LOG_FATAL("Quorum invariant violated: W(" << cfg.write_quorum
                   << ") + R(" << cfg.read_quorum
-                  << ") must be > N(" << cfg.replication_factor << ")\n";
+                  << ") must be > N(" << cfg.replication_factor << ")");
         return 1;
     }
 
     // ── Parse cluster configuration ─────────────────────────────────────────
     auto cluster_entries = dkv::parse_cluster_config(cfg.cluster_conf);
-    std::cout << "[BOOT] Loaded " << cluster_entries.size()
-              << " nodes from " << cfg.cluster_conf << "\n";
+    LOG_INFO("[BOOT] Loaded " << cluster_entries.size()
+             << " nodes from " << cfg.cluster_conf);
 
     // ── Build hash ring ─────────────────────────────────────────────────────
     dkv::HashRing ring;
@@ -54,19 +61,17 @@ int main(int argc, char* argv[]) {
 
         std::string address = entry.host + ":" + std::to_string(entry.port);
         ring.add_node(id, address, cfg.vnodes);
-        std::cout << "[BOOT] Ring: " << entry.name << " (id=" << id
-                  << ") -> " << address << "\n";
+        LOG_DEBUG("[BOOT] Ring: " << entry.name << " (id=" << id
+                  << ") -> " << address);
     }
 
-    std::cout << "[BOOT] Hash ring: " << ring.node_count() << " physical nodes, "
-              << ring.size() << " virtual nodes\n";
+    LOG_INFO("[BOOT] Hash ring: " << ring.node_count() << " physical nodes, "
+             << ring.size() << " virtual nodes");
 
     // ── Boot the node ───────────────────────────────────────────────────────
-    std::cout << "[BOOT] Node " << cfg.node_id
-              << " listening on port " << cfg.port << "\n"
-              << "[BOOT] Quorum: W=" << cfg.write_quorum
-              << " R=" << cfg.read_quorum
-              << " N=" << cfg.replication_factor << "\n";
+    LOG_INFO("[BOOT] Node " << cfg.node_id << " listening on port " << cfg.port);
+    LOG_INFO("[BOOT] Quorum: W=" << cfg.write_quorum
+             << " R=" << cfg.read_quorum << " N=" << cfg.replication_factor);
 
     // ── Initialize storage engine ───────────────────────────────────────────
     dkv::StorageEngine engine;
@@ -74,7 +79,7 @@ int main(int argc, char* argv[]) {
     // ── Open WAL and recover from disk ──────────────────────────────────────
     dkv::WAL wal;
     if (!wal.open(cfg.wal_dir, cfg.fsync_interval_ms, /*batch_ops=*/100)) {
-        std::cerr << "[FATAL] Could not open WAL at " << cfg.wal_dir << "\n";
+        LOG_FATAL("Could not open WAL at " << cfg.wal_dir);
         return 1;
     }
 
@@ -92,8 +97,8 @@ int main(int argc, char* argv[]) {
                     engine.set(key, entry.value, entry.version);
                 }
             }
-            std::cout << "[BOOT] Loaded snapshot at seq " << snapshot_seq
-                      << " (" << snap_data->entries.size() << " entries)\n";
+            LOG_INFO("[BOOT] Loaded snapshot at seq " << snapshot_seq
+                     << " (" << snap_data->entries.size() << " entries)");
         }
     }
 
@@ -111,8 +116,8 @@ int main(int argc, char* argv[]) {
         }
         ++replayed;
     }
-    std::cout << "[BOOT] WAL: " << records.size() << " total records, "
-              << replayed << " replayed after snapshot\n";
+    LOG_INFO("[BOOT] WAL: " << records.size() << " total records, "
+             << replayed << " replayed after snapshot");
 
     // ── Build coordinator with durability and quorum parameters ─────────────
     dkv::ConnectionPool conn_pool;
@@ -139,13 +144,12 @@ int main(int argc, char* argv[]) {
     }
 
     membership.set_rejoin_callback([&coordinator](uint32_t node_id, const std::string& addr) {
-        std::cout << "[MEMBERSHIP] Node " << node_id << " at " << addr
-                  << " is UP - replaying hints\n";
+        LOG_INFO("[MEMBERSHIP] Node " << node_id << " at " << addr << " is UP - replaying hints");
         coordinator.replay_hints_for(node_id, addr);
     });
 
     membership.set_down_callback([](uint32_t node_id, const std::string& addr) {
-        std::cout << "[MEMBERSHIP] Node " << node_id << " at " << addr << " is DOWN\n";
+        LOG_WARN("[MEMBERSHIP] Node " << node_id << " at " << addr << " is DOWN");
     });
 
     // Wire membership into coordinator so DOWN nodes are skipped in quorum ops.
@@ -155,8 +159,8 @@ int main(int argc, char* argv[]) {
     dkv::Heartbeat heartbeat(membership, cfg.node_id,
                              static_cast<int>(cfg.heartbeat_interval_ms), 500);
     heartbeat.start();
-    std::cout << "[BOOT] Heartbeat started (interval=" << cfg.heartbeat_interval_ms
-              << "ms, timeout=" << cfg.heartbeat_timeout_ms << "ms)\n";
+    LOG_INFO("[BOOT] Heartbeat started (interval=" << cfg.heartbeat_interval_ms
+             << "ms, timeout=" << cfg.heartbeat_timeout_ms << "ms)");
 
     // Create TCP server in cluster mode (routes through coordinator)
     dkv::TCPServer server(engine, coordinator, cfg.port,
@@ -166,14 +170,14 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    std::cout << "[BOOT] Server running in cluster mode\n";
+    LOG_INFO("[BOOT] Server running in cluster mode");
     server.run();
     heartbeat.stop();
 
     // ── Graceful shutdown: flush WAL ─────────────────────────────────────────
     wal.sync();
     wal.close();
-    std::cout << "[SHUTDOWN] WAL flushed and closed\n";
+    LOG_INFO("[SHUTDOWN] WAL flushed and closed");
 
     return 0;
 }
