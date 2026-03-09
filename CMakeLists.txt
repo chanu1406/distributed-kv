@@ -114,6 +114,13 @@ add_executable(bench_storage
 )
 target_link_libraries(bench_storage PRIVATE dkv_core)
 
+add_executable(bench_cluster
+    bench/bench_cluster.cpp
+)
+# bench_cluster is a pure POSIX TCP client — no dkv_core needed.
+target_link_libraries(bench_cluster PRIVATE pthread)
+target_include_directories(bench_cluster PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
 # ── Integration Tests (TCP server tests — separate binary) ───────────────────
 add_executable(dkv_integration_tests
     tests/integration/test_tcp_server.cpp
