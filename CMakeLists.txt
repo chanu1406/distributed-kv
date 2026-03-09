@@ -121,6 +121,13 @@ add_executable(bench_cluster
 target_link_libraries(bench_cluster PRIVATE pthread)
 target_include_directories(bench_cluster PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+# ── CLI Client ───────────────────────────────────────────────────────────────
+add_executable(dkv_cli
+    tools/dkv_cli.cpp
+)
+# dkv_cli is a pure POSIX TCP client — no dkv_core needed.
+target_link_libraries(dkv_cli PRIVATE pthread)
+
 # ── Integration Tests (TCP server tests — separate binary) ───────────────────
 add_executable(dkv_integration_tests
     tests/integration/test_tcp_server.cpp

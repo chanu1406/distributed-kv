@@ -16,3 +16,7 @@ Thumbs.db
 # Project internals
 CONTEXT.md
 data/
+
+# Spec / design docs
+*.md
+!README.md

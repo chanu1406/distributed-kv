@@ -21,6 +21,18 @@ inline uint64_t now_ms() {
 }
 }  // namespace
 
+uint64_t Coordinator::next_ts() {
+    uint64_t wall = now_ms();
+    uint64_t prev = last_ts_.load(std::memory_order_relaxed);
+    uint64_t ts   = (wall > prev) ? wall : prev + 1;
+    // CAS loop: another thread may have bumped last_ts_ concurrently.
+    while (!last_ts_.compare_exchange_weak(prev, ts,
+                                           std::memory_order_relaxed)) {
+        ts = (wall > prev) ? wall : prev + 1;
+    }
+    return ts;
+}
+
 Coordinator::Coordinator(StorageEngine& engine, HashRing& ring,
                          ConnectionPool& pool, uint32_t node_id,
                          WAL* wal, const std::string& snapshot_dir,
@@ -121,7 +133,7 @@ std::string Coordinator::handle_command(const Command& cmd) {
 }
 
 std::string Coordinator::execute_local(const Command& cmd) {
-    const uint64_t ts = now_ms();
+    const uint64_t ts = next_ts();
 
     switch (cmd.type) {
         case CommandType::PING:
@@ -224,7 +236,9 @@ std::string Coordinator::quorum_write(const std::string& key,
 
     // One version shared across all replicas (LWW: coordinator's timestamp
     // + node_id as tiebreaker, per §5.A of CONTEXT.md).
-    const Version version{now_ms(), node_id_};
+    // next_ts() guarantees monotonically increasing timestamps even when
+    // two operations from this node land in the same wall-clock millisecond.
+    const Version version{next_ts(), node_id_};
 
     // Scatter writes to all N replicas via the shared thread pool.
     std::atomic<int> acks{0};

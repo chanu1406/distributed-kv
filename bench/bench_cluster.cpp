@@ -1,4 +1,4 @@
-// bench_cluster.cpp — End-to-end cluster benchmark
+// bench_cluster.cpp: End-to-end cluster benchmark
 // Measures TCP throughput and latency across a live running DKV cluster.
 //
 // Usage: ./bin/bench_cluster [--host H] [--port P] [--ops N] [--threads N]

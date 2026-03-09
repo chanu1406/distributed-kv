@@ -102,6 +102,10 @@ private:
     // Optional Phase-6 membership tracker (nullptr = no DOWN-node awareness).
     Membership* membership_ = nullptr;
 
+    // Monotonic timestamp: guarantees strictly increasing versions even when
+    // two operations from this node land in the same millisecond (LWW fix).
+    std::atomic<uint64_t> last_ts_{0};
+
     // ── Quorum thread pool (Task 2: replaces per-request thread spawns) ───────
     std::unique_ptr<ThreadPool> quorum_pool_;
 
@@ -166,6 +170,12 @@ private:
 
     /// Serialise a Command back into its wire-format line (no trailing newline).
     static std::string serialize_command_line(const Command& cmd);
+
+    /// Monotonic timestamp generator: returns a value strictly greater than
+    /// any previous call, even within the same millisecond. Prevents the LWW
+    /// edge case where SET and DEL at the same millisecond produce identical
+    /// versions and the second operation is silently rejected.
+    uint64_t next_ts();
 
     /// Trigger a snapshot if ops_since_snapshot_ >= snapshot_interval_.
     void maybe_snapshot();
