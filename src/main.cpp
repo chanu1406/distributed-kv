@@ -103,12 +103,12 @@ int main(int argc, char* argv[]) {
     }
 
     // Replay WAL records written after the snapshot
-    auto records = wal.recover();
+    auto records = wal.recover(snapshot_seq);
     size_t replayed = 0;
     for (const auto& rec : records) {
         if (rec.seq_no <= snapshot_seq) continue;  // already in snapshot
 
-        dkv::Version v{rec.timestamp_ms, cfg.node_id};
+        dkv::Version v{rec.timestamp_ms, rec.node_id.value_or(cfg.node_id)};
         if (rec.op_type == dkv::OpType::SET) {
             engine.set(rec.key, rec.value, v);
         } else {
@@ -174,10 +174,9 @@ int main(int argc, char* argv[]) {
     server.run();
     heartbeat.stop();
 
-    // ── Graceful shutdown: flush WAL ─────────────────────────────────────────
-    wal.sync();
-    wal.close();
-    LOG_INFO("[SHUTDOWN] WAL flushed and closed");
+    // WAL was constructed before coordinator: its destructor flushes/closes
+    // only after the coordinator has drained every queued read repair.
+    LOG_INFO("[SHUTDOWN] Server stopped; draining repairs before WAL close");
 
     return 0;
 }

@@ -4,6 +4,8 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <cerrno>
+#include <system_error>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -93,20 +95,27 @@ uint64_t WAL::append(const WalRecord& record) {
     return rec.seq_no;
 }
 
-std::vector<WalRecord> WAL::recover() {
+std::vector<WalRecord> WAL::recover(uint64_t snapshot_seq) {
+    std::lock_guard lock(mutex_);
     std::vector<WalRecord> records;
+    if (snapshot_seq >= next_seq_no_) next_seq_no_ = snapshot_seq + 1;
 
     // Read entire file into memory for simplicity
     off_t file_size = ::lseek(fd_, 0, SEEK_END);
-    if (file_size <= 0) {
+    if (file_size < 0) throw std::system_error(errno, std::generic_category(), "WAL seek");
+    if (file_size == 0) {
         return records;
     }
 
     std::vector<uint8_t> data(static_cast<size_t>(file_size));
-    ::lseek(fd_, 0, SEEK_SET);
-    ssize_t bytes_read = ::read(fd_, data.data(), data.size());
-    if (bytes_read <= 0) {
-        return records;
+    size_t bytes_read = 0;
+    while (bytes_read < data.size()) {
+        ssize_t n = ::pread(fd_, data.data() + bytes_read, data.size() - bytes_read,
+                            static_cast<off_t>(bytes_read));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) throw std::system_error(n < 0 ? errno : EIO,
+                                           std::generic_category(), "WAL read");
+        bytes_read += static_cast<size_t>(n);
     }
 
     // Seek back to end for future appends
@@ -126,13 +135,19 @@ std::vector<WalRecord> WAL::recover() {
             break;
         }
 
-        records.push_back(std::move(rec));
         offset += consumed;
 
         // Track highest seq_no for future appends
         if (rec.seq_no >= next_seq_no_) {
             next_seq_no_ = rec.seq_no + 1;
         }
+        records.push_back(std::move(rec));
+    }
+
+    // Leaving the bad suffix in place would make every later append invisible
+    // to the next recovery, which stops at the same invalid record.
+    if (offset < data.size() && ::ftruncate(fd_, static_cast<off_t>(offset)) != 0) {
+        throw std::system_error(errno, std::generic_category(), "WAL tail truncate");
     }
 
     return records;
@@ -263,11 +278,13 @@ std::vector<uint8_t> WAL::serialize(const WalRecord& record) {
 
     write_u64(payload, record.seq_no);
     write_u64(payload, record.timestamp_ms);
-    payload.push_back(static_cast<uint8_t>(record.op_type));
+    payload.push_back(static_cast<uint8_t>(record.op_type) |
+                      (record.node_id.has_value() ? 0x80 : 0));
     write_u32(payload, static_cast<uint32_t>(record.key.size()));
     payload.insert(payload.end(), record.key.begin(), record.key.end());
     write_u32(payload, static_cast<uint32_t>(record.value.size()));
     payload.insert(payload.end(), record.value.begin(), record.value.end());
+    if (record.node_id) write_u32(payload, *record.node_id);
 
     // Compute CRC32 over the payload
     uint32_t checksum = crc32(payload.data(), payload.size());
@@ -299,19 +316,28 @@ bool WAL::deserialize(const uint8_t* data, size_t len,
     // Read fixed fields
     uint64_t seq_no       = read_u64(payload + 0);
     uint64_t timestamp_ms = read_u64(payload + 8);
-    auto     op_type      = static_cast<OpType>(payload[16]);
+    const bool has_node_id = (payload[16] & 0x80) != 0;
+    const uint8_t op = payload[16] & 0x7f;
+    if (op > static_cast<uint8_t>(OpType::DEL)) return false;
+    auto     op_type      = static_cast<OpType>(op);
     uint32_t key_len      = read_u32(payload + 17);
 
     // Check we can read past the key to the val_len field
     // payload offset of val_len = 21 + key_len
-    if (21 + key_len + 4 > payload_avail) {
+    if (key_len > payload_avail - 25) {
         return false;
     }
 
     uint32_t val_len = read_u32(payload + 21 + key_len);
 
     // Total payload size
-    size_t total_payload = 21 + key_len + 4 + val_len;
+    const size_t value_offset = size_t{25} + key_len;
+    if (val_len > payload_avail - value_offset) return false;
+    size_t total_payload = value_offset + val_len;
+    if (has_node_id) {
+        if (payload_avail - total_payload < 4) return false;
+        total_payload += 4;
+    }
     size_t total_record  = HEADER_SIZE + total_payload;
 
     if (total_record > len) {
@@ -328,6 +354,9 @@ bool WAL::deserialize(const uint8_t* data, size_t len,
     out.seq_no       = seq_no;
     out.timestamp_ms = timestamp_ms;
     out.op_type      = op_type;
+    out.node_id = has_node_id
+        ? std::optional<uint32_t>(read_u32(payload + total_payload - 4))
+        : std::nullopt;
     out.key.assign(reinterpret_cast<const char*>(payload + 21),              key_len);
     out.value.assign(reinterpret_cast<const char*>(payload + 25 + key_len),  val_len);
 

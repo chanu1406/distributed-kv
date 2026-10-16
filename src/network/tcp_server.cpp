@@ -88,9 +88,10 @@ bool TCPServer::setup_wakeup() {
         return false;
     }
     wakeup_read_fd_  = fds[0];
-    wakeup_write_fd_ = fds[1];
     set_nonblocking(wakeup_read_fd_);
-    set_nonblocking(wakeup_write_fd_);
+    set_nonblocking(fds[1]);
+    // stop() may run on another thread while startup is still in progress.
+    wakeup_write_fd_.store(fds[1], std::memory_order_release);
     return true;
 }
 
@@ -155,6 +156,11 @@ void TCPServer::run() {
         }
     }
 
+    // A drain timeout may stop socket service, but workers still own references
+    // to this server and its coordinator. Join before returning to their owners.
+    pool_.shutdown();
+    drain_responses();
+
     // Close the listen socket now so callers can rebind immediately after join()
     if (listen_fd_ >= 0) {
         poller_->remove_fd(listen_fd_);
@@ -166,9 +172,10 @@ void TCPServer::run() {
 void TCPServer::stop() {
     if (draining_.exchange(true)) return;  // already stopping
     // Wake up the event loop so it starts the drain sequence
-    if (wakeup_write_fd_ >= 0) {
+    const int wakeup_fd = wakeup_write_fd_.load(std::memory_order_acquire);
+    if (wakeup_fd >= 0) {
         char c = 1;
-        ::write(wakeup_write_fd_, &c, 1);
+        ::write(wakeup_fd, &c, 1);
     } else {
         running_ = false;  // never started
     }

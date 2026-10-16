@@ -355,3 +355,26 @@ TEST(Protocol, VersionedValueRoundTrip) {
     EXPECT_EQ(r.timestamp_ms, 999000111ULL);
     EXPECT_EQ(r.node_id, 5u);
 }
+
+TEST(Protocol, RejectsMalformedVersionedResponses) {
+    for (const std::string response : {
+             "$V 1x a 100 1\n", "$V 1 a 100x 1\n", "$V 1 a 100 1x\n",
+             "$V 1 a 100 1x", "$V 4294967295 a 100 1\n"}) {
+        EXPECT_FALSE(dkv::parse_versioned_response(response).found) << response;
+    }
+}
+
+TEST(Protocol, TombstoneAndAbsenceAreDistinctIncludingZeroVersion) {
+    const auto tombstone = dkv::parse_versioned_response("$T 0 0\n");
+    EXPECT_TRUE(tombstone.valid);
+    EXPECT_TRUE(tombstone.is_tombstone);
+    EXPECT_FALSE(tombstone.found);
+    EXPECT_EQ(tombstone.timestamp_ms, 0u);
+    EXPECT_EQ(tombstone.node_id, 0u);
+    const auto absent = dkv::parse_versioned_response("-NOT_FOUND\n");
+    EXPECT_TRUE(absent.valid);
+    EXPECT_FALSE(absent.is_tombstone);
+    for (const std::string reply : {"$T 1x 2\n", "$T 1 2x\n", "$T 1 2", "-ERR unavailable\n"}) {
+        EXPECT_FALSE(dkv::parse_versioned_response(reply).valid) << reply;
+    }
+}

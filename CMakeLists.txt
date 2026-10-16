@@ -139,3 +139,8 @@ target_link_libraries(dkv_integration_tests PRIVATE
 )
 
 gtest_discover_tests(dkv_integration_tests)
+
+# Isolate persistence fault injection (write interposition) from other tests.
+add_executable(dkv_recovery_tests tests/integration/test_recovery_boundaries.cpp)
+target_link_libraries(dkv_recovery_tests PRIVATE dkv_core GTest::gtest_main ${CMAKE_DL_LIBS})
+gtest_discover_tests(dkv_recovery_tests)

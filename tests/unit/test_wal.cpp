@@ -332,3 +332,128 @@ TEST_F(WalTest, AppendAfterTruncateWorks) {
         wal.close();
     }
 }
+
+TEST_F(WalTest, AppendAfterTornTailSurvivesSecondRecovery) {
+    dkv::WalRecord rec;
+    rec.key = "key";
+    rec.value = "value";
+    {
+        dkv::WAL wal;
+        ASSERT_TRUE(wal.open(test_dir));
+        wal.append(rec);
+        wal.append(rec);
+        wal.close();
+    }
+    const auto path = test_dir + "/wal.bin";
+    std::filesystem::resize_file(path, std::filesystem::file_size(path) - 1);
+    {
+        dkv::WAL wal;
+        ASSERT_TRUE(wal.open(test_dir));
+        ASSERT_EQ(wal.recover().size(), 1u);
+        rec.key = "after_recovery";
+        EXPECT_EQ(wal.append(rec), 2u);
+        wal.close();
+    }
+    dkv::WAL wal;
+    ASSERT_TRUE(wal.open(test_dir));
+    auto records = wal.recover();
+    wal.close();
+    ASSERT_EQ(records.size(), 2u);
+    EXPECT_EQ(records.back().key, "after_recovery");
+}
+
+TEST_F(WalTest, RejectsOverflowingKeyLength) {
+    std::filesystem::create_directories(test_dir);
+    // Legacy record: key_len=UINT32_MAX wraps the original 32-bit bound check.
+    std::string bytes(29, '\0');
+    for (size_t i = 21; i < 25; ++i) bytes[i] = static_cast<char>(0xff);
+    std::ofstream(test_dir + "/wal.bin", std::ios::binary).write(bytes.data(), bytes.size());
+    dkv::WAL wal;
+    ASSERT_TRUE(wal.open(test_dir));
+    EXPECT_TRUE(wal.recover().empty());
+    wal.close();
+}
+
+TEST_F(WalTest, DestructionJoinsFsyncAndClosesWal) {
+    ASSERT_EXIT({
+        {
+            dkv::WAL wal;
+            if (!wal.open(test_dir, 1, 0)) std::exit(2);
+            dkv::WalRecord rec;
+            rec.key = "last";
+            rec.value = "write";
+            wal.append(rec);
+        }
+        std::exit(0);
+    }, ::testing::ExitedWithCode(0), "");
+    dkv::WAL wal;
+    ASSERT_TRUE(wal.open(test_dir));
+    const auto records = wal.recover();
+    wal.close();
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records[0].key, "last");
+}
+
+TEST_F(WalTest, MixedLegacyAndVersionedRecordsSurviveCompaction) {
+    dkv::WalRecord rec;
+    rec.key = "k";
+    rec.value = "v";
+    {
+        dkv::WAL wal;
+        ASSERT_TRUE(wal.open(test_dir));
+        wal.append(rec); // legacy record without origin
+        rec.node_id = 0;
+        wal.append(rec); // node 0 is present, not a legacy sentinel
+        rec.node_id = UINT32_MAX;
+        rec.op_type = dkv::OpType::DEL;
+        rec.value.clear();
+        wal.append(rec);
+        const auto records = wal.recover();
+        ASSERT_EQ(records.size(), 3u);
+        EXPECT_FALSE(records[0].node_id.has_value());
+        EXPECT_EQ(records[1].node_id, 0u);
+        wal.truncate_before(1);
+    }
+    dkv::WAL wal;
+    ASSERT_TRUE(wal.open(test_dir));
+    const auto records = wal.recover(1);
+    ASSERT_EQ(records.size(), 2u);
+    EXPECT_EQ(records[0].node_id, 0u);
+    EXPECT_EQ(records[1].node_id, UINT32_MAX);
+    EXPECT_EQ(records[1].op_type, dkv::OpType::DEL);
+    EXPECT_EQ(wal.append(rec), 4u);
+}
+
+TEST_F(WalTest, EveryTruncatedVersionedTailAllowsFurtherRecovery) {
+    dkv::WalRecord rec;
+    rec.key = "key";
+    rec.value = "value";
+    rec.node_id = 7;
+    {
+        dkv::WAL wal;
+        ASSERT_TRUE(wal.open(test_dir));
+        wal.append(rec);
+    }
+    const auto path = test_dir + "/wal.bin";
+    std::ifstream in(path, std::ios::binary);
+    const std::string original((std::istreambuf_iterator<char>(in)), {});
+    in.close();
+    for (size_t cut = 1; cut < original.size(); ++cut) {
+        SCOPED_TRACE(cut);
+        std::ofstream(path, std::ios::binary | std::ios::trunc)
+            .write(original.data(), static_cast<std::streamsize>(cut));
+        {
+            dkv::WAL wal;
+            ASSERT_TRUE(wal.open(test_dir));
+            EXPECT_TRUE(wal.recover(10).empty());
+            EXPECT_EQ(wal.append(rec), 11u);
+        }
+        dkv::WAL wal;
+        ASSERT_TRUE(wal.open(test_dir));
+        const auto records = wal.recover(10);
+        ASSERT_EQ(records.size(), 1u);
+        EXPECT_EQ(records[0].seq_no, 11u);
+        EXPECT_EQ(records[0].node_id, 7u);
+        EXPECT_EQ(records[0].value, "value");
+    }
+}

@@ -324,62 +324,37 @@ std::string format_versioned_value(const std::string& value,
          + std::to_string(node_id) + "\n";
 }
 
+std::string format_versioned_tombstone(uint64_t timestamp_ms, uint32_t node_id) {
+    return "$T " + std::to_string(timestamp_ms) + " " + std::to_string(node_id) + "\n";
+}
+
 VersionedGetResult parse_versioned_response(const std::string& resp) {
     VersionedGetResult result;
-
-    // -NOT_FOUND\n
     if (resp == "-NOT_FOUND\n") {
-        return result;  // found=false
+        result.valid = true;
+        return result;
     }
+    if (resp.size() < 4 || resp.back() != '\n') return {};
+    const bool tombstone = resp.compare(0, 3, "$T ") == 0;
+    if (!tombstone && resp.compare(0, 3, "$V ") != 0) return {};
 
-    // $V <val_len> <value> <timestamp_ms> <node_id>\n
-    if (resp.size() < 4 || resp[0] != '$' || resp[1] != 'V' || resp[2] != ' ') {
-        return result;  // unrecognised / error response
+    const char* data = resp.data();
+    const size_t end = resp.size() - 1;
+    size_t pos = 3;
+    if (!tombstone) {
+        uint32_t value_len = 0;
+        if (!parse_u32(data, end, pos, value_len) ||
+            !consume_space(data, end, pos) ||
+            !read_bytes(data, end, pos, value_len, result.value) ||
+            !consume_space(data, end, pos)) return {};
     }
+    if (!parse_u64(data, end, pos, result.timestamp_ms) ||
+        !consume_space(data, end, pos) ||
+        !parse_u32(data, end, pos, result.node_id) || pos != end) return {};
 
-    // Work on the content between "$V " and the trailing '\n'
-    const char* p   = resp.data() + 3;             // after "$V "
-    const char* end = resp.data() + resp.size() - 1; // points at '\n'
-
-    if (p >= end) return result;
-
-    // Parse val_len
-    uint32_t val_len = 0;
-    {
-        const char* sp = static_cast<const char*>(std::memchr(p, ' ',
-                             static_cast<size_t>(end - p)));
-        if (!sp) return result;
-        auto [ptr, ec] = std::from_chars(p, sp, val_len);
-        if (ec != std::errc{}) return result;
-        p = sp + 1;
-    }
-
-    // Read val_len bytes of value
-    if (p + val_len > end) return result;
-    result.value.assign(p, val_len);
-    p += val_len;
-
-    // Expect space before timestamp_ms
-    if (p >= end || *p != ' ') return result;
-    ++p;
-
-    // Parse timestamp_ms (u64)
-    {
-        const char* sp = static_cast<const char*>(std::memchr(p, ' ',
-                             static_cast<size_t>(end - p)));
-        if (!sp) return result;
-        auto [ptr, ec] = std::from_chars(p, sp, result.timestamp_ms);
-        if (ec != std::errc{}) return result;
-        p = sp + 1;
-    }
-
-    // Parse node_id (u32)
-    {
-        auto [ptr, ec] = std::from_chars(p, end, result.node_id);
-        if (ec != std::errc{}) return result;
-    }
-
-    result.found = true;
+    result.valid = true;
+    result.found = !tombstone;
+    result.is_tombstone = tombstone;
     return result;
 }
 

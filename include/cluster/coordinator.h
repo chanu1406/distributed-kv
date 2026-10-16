@@ -90,6 +90,9 @@ private:
     std::string     snapshot_dir_;
     uint64_t        snapshot_interval_ = 100000;
     std::atomic<uint64_t> ops_since_snapshot_{0};
+    // A checkpoint sequence must cover only fully applied WAL records.
+    // Hold across append, engine mutation, and snapshot/compaction.
+    std::mutex mutation_mutex_;
 
     // Quorum parameters (§9 of CONTEXT.md)
     uint32_t replication_factor_ = 1;
@@ -147,6 +150,7 @@ private:
         bool        found = false;
         std::string value;
         Version     version;
+        bool        is_tombstone = false;
     };
 
     /// Send RGET to a remote replica and parse the versioned response.
@@ -155,7 +159,7 @@ private:
 
     /// Fire-and-forget async RSET to stale replicas (read repair, §9.C).
     void read_repair_async(const std::string& key, const std::string& value,
-                           const Version& latest_ver,
+                           const Version& latest_ver, bool is_del,
                            std::vector<NodeInfo> stale_replicas);
 
     // ── Legacy / local execution ─────────────────────────────────────────────

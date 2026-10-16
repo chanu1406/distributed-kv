@@ -8,6 +8,7 @@
 #include <vector>
 #include <fstream>
 #include <mutex>
+#include <optional>
 
 namespace dkv {
 
@@ -24,6 +25,8 @@ struct WalRecord {
     OpType   op_type      = OpType::SET;
     std::string key;
     std::string value;  // empty for DEL
+    // Absent only in legacy records, which did not persist the LWW origin.
+    std::optional<uint32_t> node_id;
 };
 
 /// Append-only Write-Ahead Log with CRC32 integrity checks.
@@ -31,10 +34,14 @@ struct WalRecord {
 /// Record binary format:
 ///   [CRC32 4B] [SeqNo 8B] [Timestamp 8B] [OpType 1B]
 ///   [KeyLen 4B] [Key ...] [ValLen 4B] [Value ...]
+/// OpType bit 7 marks an additional [NodeId 4B] after Value, covered by CRC.
+/// Legacy records (OpType 0/1) remain readable.
 ///
 /// The CRC32 covers everything after the checksum field.
 class WAL {
 public:
+    ~WAL() { close(); }
+
     /// Open (or create) the WAL file at `directory/wal.bin`.
     /// Returns false if the directory cannot be created or the file cannot
     /// be opened.
@@ -52,8 +59,10 @@ public:
     uint64_t append(const WalRecord& record);
 
     /// Read all valid records from the WAL file.  Stops at the first
-    /// record with an invalid CRC32 checksum (crash-safe recovery).
-    std::vector<WalRecord> recover();
+    /// record with an invalid CRC32 checksum, discarding the invalid tail
+    /// before future appends. Throws on I/O failure. Resume sequence allocation
+    /// after both the recovered WAL and the loaded snapshot.
+    std::vector<WalRecord> recover(uint64_t snapshot_seq = 0);
 
     /// Explicitly fsync the WAL file to disk.
     void sync();

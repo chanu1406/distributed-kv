@@ -90,17 +90,22 @@ std::string format_forward(uint32_t hops, const std::string& inner_line);
 std::string format_versioned_value(const std::string& value,
                                    uint64_t timestamp_ms, uint32_t node_id);
 
+/// $T <timestamp_ms> <node_id>\n -- a retained deletion, not an absent key.
+std::string format_versioned_tombstone(uint64_t timestamp_ms, uint32_t node_id);
+
 /// Result of parsing a versioned GET response from a replica.
 struct VersionedGetResult {
     bool        found        = false;
     std::string value;
     uint64_t    timestamp_ms = 0;
     uint32_t    node_id      = 0;
+    bool        is_tombstone = false;
+    bool        valid        = false;
 };
 
 /// Parse the response returned by a replica to an RGET command.
-/// Handles "$V ..." (found), "-NOT_FOUND\n" (not found), and anything else
-/// (treated as an error / not-found).
+/// Handles "$V ...", "$T ...", and "-NOT_FOUND\n". Other or malformed
+/// responses are invalid and must not count towards a read quorum.
 VersionedGetResult parse_versioned_response(const std::string& resp);
 
 }  // namespace dkv

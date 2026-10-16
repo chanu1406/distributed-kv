@@ -1,0 +1,193 @@
+Correctness audit, 2026-10-16
+Baseline: d11a12e (clean master; original 180/180 tests passed).
+
+Contract established from implementation
+--------------------------------------
+StorageEngine serializes each shard's mutations and accepts only strictly
+greater (timestamp_ms, node_id) tuples. Deletions retain a versioned tombstone.
+all_entries locks every shard while copying. Equal versions are idempotent only
+when their payloads agree. The coordinator assigns increasing timestamps within
+one process; there is no consensus, causal clock, or linearizability guarantee.
+
+Client writes scatter to the ring's N distinct replicas, wait for all attempts,
+and require W successful replies. Stale replica writes can legitimately be
+ignored under LWW while receiving +OK. Reads target the ring's first R replicas;
+the repaired code requires R valid replies and compares live values AND deletes.
+It retains this target-selection policy, rather than adding quorum fallback.
+
+Coordinator mutation paths append to WAL before applying to memory. WAL fsync is
+batched by timer/operation count: +OK does not promise fsync-before-ack. Recovery
+loads the highest-numbered snapshot and replays WAL records above its sequence.
+Snapshots contain tombstone, key, value, timestamp, and origin. Legacy WAL records
+contained CRC32, sequence, timestamp, operation, key, and value, but no origin.
+
+The reactor owns sockets/buffers; pool workers execute requests and enqueue
+responses. Quorum workers share request-local completion state. Read repair uses
+a background queue. Failed remote writes create hints; membership's DOWN-to-UP
+callback replays them. This is conditional convergence, not guaranteed eventual
+delivery under every failure pattern.
+
+Confirmed defects, evidence, and repairs
+---------------------------------------
+1. Torn WAL tail poisoned subsequent recovery.
+   Repro: truncate the second record by one byte, recover the first, append a
+   new record, reopen. Original recovered only one record instead of two.
+   Fix: discard the invalid suffix under the WAL lock before accepting appends;
+   read the complete file with checked pread/EINTR handling. Recovery I/O failure
+   fails closed rather than silently accepting an incomplete read.
+   Regression: WalTest.AppendAfterTornTailSurvivesSecondRecovery; exhaustive
+   truncation of every byte position in a versioned record.
+
+2. Malformed WAL key length caused an out-of-bounds read.
+   Repro: 29-byte legacy record, bytes 21..24 = ff ff ff ff. Original 32-bit
+   arithmetic wrapped; native run died with signal 10. Linux ASan reported SEGV
+   at read_u32 -> WAL::deserialize (original wal.cpp:311) -> WAL::recover.
+   Fix: subtraction-based size_t bounds before accessing either length/value;
+   validate operation tags and optional origin length before CRC evaluation.
+   Regression: WalTest.RejectsOverflowingKeyLength.
+
+3. WAL replay changed the LWW winner and origin.
+   Repro on node 1: RSET k=old at (100,2), RSET k=new at (100,3), restart.
+   Before restart: "$V 3 new 100 3". Original after restart: "$V 3 old 100 1".
+   Fix: persist the origin in a CRC-covered extension marked by operation bit 7;
+   replay that origin. Legacy 0/1 operation records remain readable.
+   Regression: test_wal_recovery_preserves_lww_origin and mixed-format unit test.
+
+4. Empty compacted WAL restarted sequence allocation below the snapshot.
+   Repro: snapshot at sequence 2, compact to empty WAL, restart, acknowledge one
+   new SET, cleanly stop, restart again. Original returned NOT_FOUND for that SET.
+   Fix: recover(snapshot_seq) establishes the sequence allocation floor even
+   when WAL contains no records; main supplies the loaded snapshot sequence.
+   Regression: test_compacted_wal_sequence_survives_two_restarts.
+
+5. Concurrent checkpointing discarded an unapplied WAL record.
+   Deterministic original trace: gate the sequence-2 writer at its shard lock;
+   gate the sequence-3 writer after its real write syscall; release writer 2.
+   Original snapshot had seq=3, entries=2; compaction left WAL_records=0.
+   Writer 3 subsequently applied: found before restart=1, after restart=0.
+   Fix: one coordinator mutation lock spans append, application, and checkpoint.
+   Regression: RecoveryBoundaryTest.SnapshotCannotDiscardAnUnappliedWalRecord.
+   Test-only syscall/lock gates live in a separate executable. It also compiles
+   against original headers/library with DKV_ORIGINAL_REPRO, and fails there.
+
+6. Reads accepted insufficient or malformed replica replies as a quorum.
+   Repro: N=3, R=3, only one live replica holding "old"; original GET returned
+   "$3 old". A fake replica returning "$V 1x a 100 2" also counted as successful.
+   Numeric suffixes such as timestamp "100x" were silently accepted.
+   Fix: require R valid replies; distinguish malformed/error replies from valid
+   absence; parse entire numeric fields and require the terminating newline.
+   Regressions: test_read_requires_configured_quorum,
+   test_malformed_replica_reply_does_not_count_as_quorum, protocol unit cases.
+
+7. Reads discarded tombstone versions and returned stale live values.
+   Repro: one replica has old at (100,1), another deleted at (200,2).
+   Original quorum GET returned "$3 old" instead of NOT_FOUND.
+   Fix: expose tombstone metadata, transmit "$T timestamp node_id", compare
+   deletes by the same LWW ordering, and repair with RDEL when deletion wins.
+   Regressions cover both local/remote winners, equal-time origin tiebreaks,
+   zero versions, repair, and restart.
+
+8. Local read repair bypassed WAL; shutdown could close WAL before queued repairs.
+   Repro: read a remote newer value, observe it repaired locally, cleanly restart
+   the repaired node: original RGET returned NOT_FOUND. A gated queue additionally
+   demonstrated repaired_in_memory=1, recovered_records=0 if WAL closed first.
+   Fix: local repair uses RSET/RDEL persistence paths. WAL destruction closes and
+   joins fsync after coordinator destruction drains repairs. Server run joins
+   workers before returning, including after its socket-drain timeout.
+   Regressions: test_local_read_repair_is_recoverable,
+   RecoveryBoundaryTest.QueuedRepairDrainsBeforeWalDestruction, WAL lifetime test.
+
+9. Quorum completion raced with destruction of its condition variable.
+   Original TSan CoordinatorTest.SetAndGetLocal returned exit 66 with two races:
+   pthread_cond_destroy in quorum_write/read versus worker pthread_cond_signal.
+   The original full TSan run also stalled after these failures.
+   Fix: completion decrement AND notification hold the waiter's mutex, covering
+   notification lifetime and preventing the check-to-wait missed-wakeup window.
+   Existing single-node and concurrent quorum tests are sanitizer regressions.
+
+10. Reactor startup did not safely publish the wakeup descriptor to stop().
+   TSan identified stop's write racing with setup_wakeup's pipe creation in
+   NoNewConnectionsAfterStop and InFlightRequestCompletesBeforeShutdown.
+   Fix: publish the descriptor atomically after setup, acquire it in stop().
+   The same existing integration cases reproduce this on the original build.
+
+Validation and reproduction
+---------------------------
+Builds use existing GoogleTest 1.14 sources; no dependencies were added.
+
+  cmake -S . -B build/audit-final -DCMAKE_BUILD_TYPE=Debug \
+    -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST="$PWD/build/_deps/googletest-src"
+  cmake --build build/audit-final -j 6
+  ctest --test-dir build/audit-final --timeout 20 --output-on-failure
+  python3 tests/integration/test_correctness.py \
+    --binary build/audit-final/bin/dkv_node --artifacts build/audit-evidence/final
+
+The Python test is standard-library only, retains node logs/raw files, and runs
+real node processes. Its independent reference model uses Python tuple ordering
+(seed 1729), reordered deliveries and identical duplicates on three replicas,
+then fsyncs the WAL explicitly before SIGKILL/restart. This tests the stated
+persisted boundary; it does not imply that an ordinary acknowledgement fsyncs.
+Other scenarios cover a killed/restarted replica and hinted deletion delivery,
+malformed replies, and persistent repair. Existing network tests cover partial
+frames, large payloads, multiple clients, and shutdown; their fixed ports require
+running separate build suites sequentially.
+
+For separate sanitizer builds, add these CMake flags (never combine ASan/TSan):
+  -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all'
+  -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined
+or:
+  -DCMAKE_CXX_FLAGS='-fsanitize=thread -fno-omit-frame-pointer'
+  -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+  -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
+
+Native environment: Apple Clang 17, arm64 macOS 26.5.1, CMake 4.3.2.
+ASan initialization hung and TSan segfaulted even with an empty main; process
+sampling located ASan's initialization deadlock. UBSan worked natively.
+Linux fallback: existing local ioflux-dxt-eval:go image, GCC 13.3, CMake 3.28.3,
+aarch64 Linux 6.12.69. Disposable containers had network disabled, source mounted
+read-only, and only build/audit-evidence/linux mounted writable.
+
+Clang --analyze ran on all 20 source translation units. The only finding was
+blocking read inside WAL::truncate_before's lock; that lock intentionally
+excludes appends while rewriting the WAL. The changed code compiles with the
+project's -Wall -Wextra -Wpedantic -Werror flags.
+
+Final results: 189/189 CTest cases and 9/9 real-process scenarios pass in each
+of native Debug, native UBSan, Linux ASan/UBSan, and separate Linux TSan builds.
+Linux sanitizer logs, including logs from deliberately killed nodes, contain
+no findings on the repaired builds. Baseline ASan reports the malformed-WAL
+read fault; baseline TSan reports both the quorum and wakeup publication races
+(exit 66). The five initial process regressions, torn-tail test, overflow test,
+and gated checkpoint reproduction failed before their respective repairs.
+
+Local full logs, before/after raw files, native sanitizer probes, and the exact
+Linux runner scripts are retained under build/audit-evidence/. Original source
+is archived under build/audit-original-source/. To repeat original failures,
+build that checkout and point the same Python script at its dkv_node. For the
+checkpoint repro, compile tests/integration/test_recovery_boundaries.cpp with
+-DDKV_ORIGINAL_REPRO, original include/ and libdkv_core.a, and GoogleTest libraries.
+For race reproductions, run original CoordinatorTest.SetAndGetLocal and
+TCPIntegrationTest.NoNewConnectionsAfterStop in a TSan build.
+
+Remaining limitations and unverified boundaries
+-----------------------------------------------
+These tests do not establish overall correctness or linearizability. In
+particular, power-loss durability is still unverified: snapshot publication is
+not an fsync/rename/directory-fsync protocol, WAL append/compaction have unchecked
+write/fsync results, and disk-full/short-write faults were not injected. The
+checkpoint lock fixes the demonstrated application/sequence race, not these
+separate persistence failures. Large snapshots now delay WAL-backed mutations.
+
+No exhaustive partition, delay, packet-fragmentation, descriptor-reuse, or
+pipelining history check was performed. The reactor still dispatches concurrent
+commands and identifies responses by fd; replication still uses one send call.
+Request framing is newline-oriented despite inline lengths. Hinted handoff's
+concurrent store/replay/clear and disk-failure behavior, retry after short outages,
+clock rollback/restart collisions, and equal-version conflicting payloads remain
+outside the validated guarantees. No global anti-entropy or consensus was added.
+
+Compatibility: new code reads legacy WAL records, but their omitted origin IDs
+cannot be reconstructed and retain the historical local-node fallback. Older
+binaries cannot read the new tagged WAL records or versioned tombstone replies;
+mixed-version operation/downgrades are not supported by this repair. Upgrade all
+nodes before relying on corrected deletion convergence.

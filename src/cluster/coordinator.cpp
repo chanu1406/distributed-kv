@@ -134,6 +134,11 @@ std::string Coordinator::handle_command(const Command& cmd) {
 
 std::string Coordinator::execute_local(const Command& cmd) {
     const uint64_t ts = next_ts();
+    std::unique_lock mutation_lock(mutation_mutex_, std::defer_lock);
+    if (wal_ && (cmd.type == CommandType::SET || cmd.type == CommandType::DEL ||
+                 cmd.type == CommandType::RSET || cmd.type == CommandType::RDEL)) {
+        mutation_lock.lock();
+    }
 
     switch (cmd.type) {
         case CommandType::PING:
@@ -153,6 +158,7 @@ std::string Coordinator::execute_local(const Command& cmd) {
             if (wal_) {
                 WalRecord rec;
                 rec.timestamp_ms = ts;
+                rec.node_id      = node_id_;
                 rec.op_type      = OpType::SET;
                 rec.key           = cmd.key;
                 rec.value         = cmd.value;
@@ -168,6 +174,7 @@ std::string Coordinator::execute_local(const Command& cmd) {
             if (wal_) {
                 WalRecord rec;
                 rec.timestamp_ms = ts;
+                rec.node_id      = node_id_;
                 rec.op_type      = OpType::DEL;
                 rec.key           = cmd.key;
                 wal_->append(rec);
@@ -187,6 +194,7 @@ std::string Coordinator::execute_local(const Command& cmd) {
             if (wal_) {
                 WalRecord rec;
                 rec.timestamp_ms = cmd.timestamp_ms;
+                rec.node_id      = cmd.node_id;
                 rec.op_type      = OpType::SET;
                 rec.key           = cmd.key;
                 rec.value         = cmd.value;
@@ -202,6 +210,7 @@ std::string Coordinator::execute_local(const Command& cmd) {
             if (wal_) {
                 WalRecord rec;
                 rec.timestamp_ms = cmd.timestamp_ms;
+                rec.node_id      = cmd.node_id;
                 rec.op_type      = OpType::DEL;
                 rec.key           = cmd.key;
                 wal_->append(rec);
@@ -215,6 +224,10 @@ std::string Coordinator::execute_local(const Command& cmd) {
             // Return value + version so the quorum coordinator can compare
             // across replicas and pick the highest-version response.
             auto result = engine_.get(cmd.key);
+            if (result.is_tombstone) {
+                return format_versioned_tombstone(result.version.timestamp_ms,
+                                                   result.version.node_id);
+            }
             if (!result.found) return format_not_found();
             return format_versioned_value(result.value,
                                           result.version.timestamp_ms,
@@ -245,6 +258,8 @@ std::string Coordinator::quorum_write(const std::string& key,
     std::atomic<int> remaining{static_cast<int>(replicas.size())};
     std::mutex done_mutex;
     std::condition_variable done_cv;
+    // All completion updates and notifications hold done_mutex: no missed
+    // wakeup, and the waiter cannot destroy done_cv before notify returns.
 
     for (const auto& replica : replicas) {
         // Phase 6: fast-path for known-DOWN remote replicas — skip the TCP
@@ -256,6 +271,7 @@ std::string Coordinator::quorum_write(const std::string& key,
                 replica.address, replica.node_id,
                 key, value, is_del, version
             });
+            std::lock_guard done_lock(done_mutex);
             if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                 done_cv.notify_one();
             }
@@ -290,6 +306,7 @@ std::string Coordinator::quorum_write(const std::string& key,
             }
 
             if (ok) acks.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard done_lock(done_mutex);
             if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                 done_cv.notify_one();
             }
@@ -298,6 +315,7 @@ std::string Coordinator::quorum_write(const std::string& key,
         if (!submitted) {
             // Pool was shut down before we could queue the task — treat as
             // failed replica so we never deadlock on done_cv.
+            std::lock_guard done_lock(done_mutex);
             if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                 done_cv.notify_one();
             }
@@ -371,6 +389,7 @@ std::string Coordinator::quorum_read(const std::string& key) {
     struct ReadResponse {
         bool        ok    = false;
         bool        found = false;
+        bool        is_tombstone = false;
         std::string value;
         Version     version;
         NodeInfo    replica;
@@ -381,6 +400,8 @@ std::string Coordinator::quorum_read(const std::string& key) {
     std::atomic<int> remaining{static_cast<int>(replicas.size())};
     std::mutex done_mutex;
     std::condition_variable done_cv;
+    // All completion updates and notifications hold done_mutex: no missed
+    // wakeup, and the waiter cannot destroy done_cv before notify returns.
 
     for (size_t i = 0; i < replicas.size(); ++i) {
         const auto& rep = replicas[i];
@@ -390,6 +411,7 @@ std::string Coordinator::quorum_read(const std::string& key) {
         if (rep.node_id != node_id_ &&
             membership_ &&
             !membership_->is_available(rep.node_id)) {
+            std::lock_guard done_lock(done_mutex);
             if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                 done_cv.notify_one();
             }
@@ -407,14 +429,17 @@ std::string Coordinator::quorum_read(const std::string& key) {
                 resp.found   = r.found;
                 resp.value   = r.value;
                 resp.version = r.version;
+                resp.is_tombstone = r.is_tombstone;
             } else {
                 auto r       = send_replication_read(r2.address, key);
                 resp.ok      = r.ok;
                 resp.found   = r.found;
                 resp.value   = r.value;
                 resp.version = r.version;
+                resp.is_tombstone = r.is_tombstone;
             }
 
+            std::lock_guard done_lock(done_mutex);
             if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                 done_cv.notify_one();
             }
@@ -423,6 +448,7 @@ std::string Coordinator::quorum_read(const std::string& key) {
         if (!submitted) {
             // Pool shut down — leave resp.ok = false (already default) and
             // decrement so we never deadlock.
+            std::lock_guard done_lock(done_mutex);
             if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                 done_cv.notify_one();
             }
@@ -442,30 +468,31 @@ std::string Coordinator::quorum_read(const std::string& key) {
     for (const auto& r : responses) {
         if (!r.ok) continue;
         ++ok_count;
-        if (r.found) {
-            if (!best || !best->found || is_newer(r.version, best->version)) {
+        if (r.found || r.is_tombstone) {
+            if (!best || is_newer(r.version, best->version)) {
                 best = &r;
             }
         }
     }
 
-    if (ok_count == 0) return format_error("QUORUM_FAILED");
+    if (ok_count < static_cast<int>(read_quorum_)) return format_error("QUORUM_FAILED");
 
-    if (!best || !best->found) return format_not_found();
+    if (!best) return format_not_found();
 
     // Collect stale replicas for async read repair (§9.C).
     std::vector<NodeInfo> stale;
     for (const auto& r : responses) {
         if (!r.ok) continue;
-        if (!r.found || is_newer(best->version, r.version)) {
+        if ((!r.found && !r.is_tombstone) || is_newer(best->version, r.version)) {
             stale.push_back(r.replica);
         }
     }
     if (!stale.empty()) {
-        read_repair_async(key, best->value, best->version, std::move(stale));
+        read_repair_async(key, best->value, best->version, best->is_tombstone,
+                          std::move(stale));
     }
 
-    return format_value(best->value);
+    return best->is_tombstone ? format_not_found() : format_value(best->value);
 }
 
 Coordinator::RemoteGetResult Coordinator::send_replication_read(
@@ -496,29 +523,35 @@ Coordinator::RemoteGetResult Coordinator::send_replication_read(
     }
 
     pool_.release(std::move(*conn));
-    result.ok = true;
-
     auto parsed      = parse_versioned_response(response);
+    result.ok        = parsed.valid;
     result.found     = parsed.found;
     result.value     = parsed.value;
     result.version   = Version{parsed.timestamp_ms, parsed.node_id};
+    result.is_tombstone = parsed.is_tombstone;
     return result;
 }
 
 void Coordinator::read_repair_async(const std::string& key,
                                      const std::string& value,
-                                     const Version& latest_ver,
+                                     const Version& latest_ver, bool is_del,
                                      std::vector<NodeInfo> stale_replicas) {
     {
         std::lock_guard<std::mutex> lock(repair_mutex_);
-        repair_queue_.emplace([this, key, value, latest_ver,
+        repair_queue_.emplace([this, key, value, latest_ver, is_del,
                                stale = std::move(stale_replicas)]() {
             for (const auto& replica : stale) {
                 if (replica.node_id == node_id_) {
-                    engine_.set(key, value, latest_ver);
+                    Command cmd{};
+                    cmd.type = is_del ? CommandType::RDEL : CommandType::RSET;
+                    cmd.key = key;
+                    cmd.value = value;
+                    cmd.timestamp_ms = latest_ver.timestamp_ms;
+                    cmd.node_id = latest_ver.node_id;
+                    execute_local(cmd);
                 } else {
                     send_replication_write(replica.address, key, value,
-                                           false, latest_ver);
+                                           is_del, latest_ver);
                 }
             }
         });

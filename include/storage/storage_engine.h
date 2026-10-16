@@ -36,6 +36,7 @@ struct GetResult {
     bool  found = false;       // true if key exists and is NOT tombstoned
     std::string value;
     Version     version;
+    bool is_tombstone = false; // distinguish a retained deletion from absence
 };
 
 /// Thread-safe, sharded in-memory key-value store with LWW versioning.

@@ -281,7 +281,7 @@ TEST_F(CoordinatorTest, RdelAppliesVersionedTombstone) {
 
     dkv::Command rget{};
     rget.type = dkv::CommandType::RGET;  rget.key = "todel";
-    EXPECT_EQ(coord.handle_command(rget), "-NOT_FOUND\n");
+    EXPECT_EQ(coord.handle_command(rget), "$T 2000 1\n");
 }
 
 // ── RSET LWW: stale write is silently rejected ────────────────────────────────

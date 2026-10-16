@@ -14,8 +14,11 @@ GetResult StorageEngine::get(const std::string& key) const {
     std::shared_lock lock(shard.mutex);
 
     auto it = shard.data.find(key);
-    if (it == shard.data.end() || it->second.is_tombstone) {
+    if (it == shard.data.end()) {
         return {};  // found=false
+    }
+    if (it->second.is_tombstone) {
+        return {false, "", it->second.version, true};
     }
 
     return {true, it->second.value, it->second.version};

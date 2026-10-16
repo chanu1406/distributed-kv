@@ -77,7 +77,7 @@ private:
     ThreadPool                               pool_;
     int                                      listen_fd_ = -1;
     int                                      wakeup_read_fd_ = -1;
-    int                                      wakeup_write_fd_ = -1;
+    std::atomic<int>                          wakeup_write_fd_{-1};
     std::atomic<bool>                        running_{false};
     std::atomic<bool>                        draining_{false};
     std::atomic<int>                         in_flight_{0};
