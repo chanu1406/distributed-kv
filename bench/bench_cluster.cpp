@@ -1,438 +1,359 @@
-// bench_cluster.cpp: End-to-end cluster benchmark
-// Measures TCP throughput and latency across a live running DKV cluster.
-//
-// Usage: ./bin/bench_cluster [--host H] [--port P] [--ops N] [--threads N]
-//                            [--pipeline N] [--key-size N] [--val-size N]
-//                            [--workload set|get|mixed|readonly] [--warmup-ops N]
-
+// Closed-loop TCP benchmark. One outstanding request per connection.
+// Preload and per-client warmup are checked and excluded from measured time.
+// JSON output is consumed by scripts/run_benchmarks.py.
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
-#include <sstream>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
-// POSIX socket headers (Linux / macOS only)
 #include <arpa/inet.h>
-#include <netinet/in.h>
+#include <fcntl.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 using namespace std::chrono;
-
-// ── Key / Value helpers ────────────────────────────────────────────────────────
-
-static std::string make_key(int i, int key_size) {
-    std::string k = "key:" + std::to_string(i);
-    while (static_cast<int>(k.size()) < key_size) k += 'x';
-    return k.substr(0, static_cast<size_t>(key_size));
-}
-
-static std::string make_val(int val_size) {
-    return std::string(static_cast<size_t>(val_size), 'v');
-}
-
-// ── Latency stats (identical pattern to bench_storage.cpp) ────────────────────
+using BenchClock = steady_clock;
 
 struct Stats {
     std::vector<int64_t> latencies_ns;
-
-    void reserve(size_t n) { latencies_ns.reserve(n); }
-
-    void record(nanoseconds ns) {
-        latencies_ns.push_back(ns.count());
-    }
-
+    void record(nanoseconds ns) { latencies_ns.push_back(ns.count()); }
     void merge(const Stats& other) {
-        latencies_ns.insert(latencies_ns.end(),
-                            other.latencies_ns.begin(),
-                            other.latencies_ns.end());
+        latencies_ns.insert(latencies_ns.end(), other.latencies_ns.begin(), other.latencies_ns.end());
     }
-
-    // Returns percentile (0-100) in microseconds.
-    double percentile(int p) {
+    // Nearest-rank quantile, including fractional percentiles.
+    double percentile(double p) {
         if (latencies_ns.empty()) return 0;
         std::sort(latencies_ns.begin(), latencies_ns.end());
-        size_t idx = static_cast<size_t>(p / 100.0 * latencies_ns.size());
-        if (idx >= latencies_ns.size()) idx = latencies_ns.size() - 1;
-        return latencies_ns[idx] / 1000.0;
-    }
-
-    double mean_us() {
-        if (latencies_ns.empty()) return 0;
-        double sum = 0;
-        for (auto v : latencies_ns) sum += static_cast<double>(v);
-        return (sum / static_cast<double>(latencies_ns.size())) / 1000.0;
+        const auto rank = static_cast<size_t>(std::ceil(p * latencies_ns.size() / 100.0));
+        return latencies_ns[std::clamp(rank, size_t{1}, latencies_ns.size()) - 1] / 1000.0;
     }
 };
-
-// ── Config / Result ───────────────────────────────────────────────────────────
 
 struct BenchConfig {
-    std::string host       = "127.0.0.1";
-    int         port       = 7001;
-    int         ops        = 100000;
-    int         threads    = 1;
-    int         pipeline   = 1;
-    int         key_size   = 16;
-    int         val_size   = 64;
-    std::string workload   = "set";   // set | get | mixed | readonly
-    int         warmup_ops = 1000;
+    std::string host = "127.0.0.1";
+    int port = 7001;
+    int ops = 100000;
+    int threads = 1;
+    int keys = 10000;
+    int key_size = 16;
+    int val_size = 64;
+    int warmup_ops = 1000;  // per client
+    double duration_seconds = 0;  // positive value overrides --ops
+    std::string workload = "set";
+    bool json = false;
 };
 
-struct BenchResult {
-    std::string name;
-    double      ops_per_sec = 0;
-    double      mean_us     = 0;
-    double      p50_us      = 0;
-    double      p99_us      = 0;
-    double      p999_us     = 0;
-    int         errors      = 0;
-    int         total_ops   = 0;
+struct Request {
+    std::string set_frame;
+    std::string get_frame;
+    std::string expected_value;
 };
 
-// ── TCP helpers ───────────────────────────────────────────────────────────────
+enum class Outcome { success, server_error, protocol_error, transport_error };
 
-static int open_connection(const std::string& host, int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+struct ThreadState {
+    Stats stats;
+    uint64_t attempted = 0, successful = 0;
+    uint64_t server_errors = 0, protocol_errors = 0, transport_errors = 0;
+    uint64_t setup_errors = 0;
+};
+
+struct BenchResult : ThreadState {
+    double elapsed_seconds = 0;
+    double success_ops_per_sec = 0;
+    double p50_us = 0, p95_us = 0, p99_us = 0, p999_us = 0;
+    bool valid = false;
+};
+
+static int open_connection(const BenchConfig& cfg) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
-
-    // Disable Nagle's algorithm for lower latency on small frames.
+    auto fail = [&]() { ::close(fd); return -1; };
     int one = 1;
-    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
-                     &one, static_cast<socklen_t>(sizeof(one)));
-
-    // 2-second send / receive timeout.
-    struct timeval tv{};
-    tv.tv_sec  = 2;
-    tv.tv_usec = 0;
-    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
-                     &tv, static_cast<socklen_t>(sizeof(tv)));
-    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
-                     &tv, static_cast<socklen_t>(sizeof(tv)));
-
-    struct sockaddr_in addr{};
+    timeval timeout{2, 0};
+    if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0 ||
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) return fail();
+    sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port   = htons(static_cast<uint16_t>(port));
-    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-        close(fd);
-        return -1;
+    addr.sin_port = htons(static_cast<uint16_t>(cfg.port));
+    if (::inet_pton(AF_INET, cfg.host.c_str(), &addr.sin_addr) != 1) return fail();
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return fail();
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        if (errno != EINPROGRESS) return fail();
+        pollfd descriptor{fd, POLLOUT, 0};
+        int ready;
+        do { ready = ::poll(&descriptor, 1, 2000); } while (ready < 0 && errno == EINTR);
+        int error = 0;
+        socklen_t length = sizeof(error);
+        if (ready <= 0 || ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0 ||
+            error != 0) return fail();
     }
-    if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
-                static_cast<socklen_t>(sizeof(addr))) != 0) {
-        close(fd);
-        return -1;
-    }
+    if (::fcntl(fd, F_SETFL, flags) < 0) return fail();
     return fd;
 }
 
-// Send exactly `len` bytes; returns false on failure.
-static bool send_all(int fd, const char* buf, size_t len) {
+static bool send_all(int fd, const std::string& frame) {
     size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = send(fd, buf + sent, len - sent, 0);
+    while (sent < frame.size()) {
+        const ssize_t n = ::send(fd, frame.data() + sent, frame.size() - sent, 0);
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return false;
         sent += static_cast<size_t>(n);
     }
     return true;
 }
 
-// Read until '\n'; returns the full line including '\n', or "" on error.
-static std::string recv_line(int fd) {
-    std::string line;
-    line.reserve(128);
-    char c = '\0';
+static Outcome exchange(int fd, const Request& request, bool is_set) {
+    if (!send_all(fd, is_set ? request.set_frame : request.get_frame))
+        return Outcome::transport_error;
+    std::string response;
+    char buffer[16384];
+    const size_t limit = std::max(size_t{1024}, request.expected_value.size());
     while (true) {
-        ssize_t n = recv(fd, &c, 1, 0);
-        if (n <= 0) return "";
-        line += c;
-        if (c == '\n') return line;
+        const ssize_t n = ::recv(fd, buffer, sizeof(buffer), 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return Outcome::transport_error;
+        response.append(buffer, static_cast<size_t>(n));
+        if (response.size() > limit) return Outcome::protocol_error;
+        const auto newline = response.find('\n');
+        if (newline == std::string::npos) continue;
+        // Extra frames cannot belong to another request: pipelining is disabled.
+        if (newline + 1 != response.size()) return Outcome::protocol_error;
+        if (response.front() == '-') return Outcome::server_error;
+        return response == (is_set ? "+OK\n" : request.expected_value)
+            ? Outcome::success : Outcome::protocol_error;
     }
 }
 
-// ── Protocol formatters (client-side; no dkv_core dependency) ─────────────────
-
-static std::string fmt_set(const std::string& key, const std::string& val) {
-    return "SET " + std::to_string(key.size()) + " " + key + " "
-         + std::to_string(val.size()) + " " + val + "\n";
-}
-
-static std::string fmt_get(const std::string& key) {
-    return "GET " + std::to_string(key.size()) + " " + key + "\n";
-}
-
-static bool is_error_response(const std::string& resp) {
-    return !resp.empty() && resp[0] == '-';
-}
-
-// ── Per-thread accumulated state ──────────────────────────────────────────────
-
-struct ThreadState {
-    Stats stats;
-    int   errors    = 0;
-    int   total_ops = 0;
-};
-
-// Run `count` operations on `fd` starting at key index `key_base`.
-// When `record` is false (warmup), latencies and error counts are discarded.
-// Returns false if the TCP connection is lost partway through.
-static bool run_ops(int fd, const BenchConfig& cfg,
-                    int key_base, int count, bool record,
-                    ThreadState& state) {
-    const std::string val = make_val(cfg.val_size);
-
-    int i = 0;
-    while (i < count) {
-        int batch = std::min(cfg.pipeline, count - i);
-
-        auto t0 = high_resolution_clock::now();
-
-        // ── Send batch ────────────────────────────────────────────────────────
-        int sent = 0;
-        for (int b = 0; b < batch; ++b) {
-            int abs_idx = key_base + i + b;
-            std::string req;
-
-            if (cfg.workload == "set") {
-                req = fmt_set(make_key(abs_idx, cfg.key_size), val);
-            } else if (cfg.workload == "get" || cfg.workload == "readonly") {
-                req = fmt_get(make_key(abs_idx, cfg.key_size));
-            } else {
-                // mixed: even ops → SET key i, odd ops → GET key i-1
-                if ((i + b) % 2 == 0) {
-                    req = fmt_set(make_key(abs_idx, cfg.key_size), val);
-                } else {
-                    int get_idx = abs_idx > 0 ? abs_idx - 1 : abs_idx;
-                    req = fmt_get(make_key(get_idx, cfg.key_size));
-                }
-            }
-
-            if (!send_all(fd, req.c_str(), req.size())) break;
-            ++sent;
-        }
-
-        if (sent == 0) return false;  // connection lost before anything was sent
-
-        // ── Receive responses for every successfully-sent request ─────────────
-        for (int b = 0; b < sent; ++b) {
-            std::string resp = recv_line(fd);
-            if (record) {
-                ++state.total_ops;
-                if (resp.empty() || is_error_response(resp)) ++state.errors;
-            }
-        }
-
-        auto t1 = high_resolution_clock::now();
-        if (record) {
-            // Batch-level latency granularity (per spec for pipeline > 1).
-            state.stats.record(duration_cast<nanoseconds>(t1 - t0));
-        }
-
-        if (sent < batch) return false;  // partial send → connection dead
-
-        i += batch;
+static std::vector<Request> make_requests(const BenchConfig& cfg) {
+    std::vector<Request> requests;
+    requests.reserve(static_cast<size_t>(cfg.keys));
+    for (int i = 0; i < cfg.keys; ++i) {
+        std::string key = "key:" + std::to_string(i);
+        key.resize(static_cast<size_t>(cfg.key_size), 'x');
+        // Values differ by key so returning another key's value is detectable.
+        std::string value = std::to_string(i);
+        value.resize(static_cast<size_t>(cfg.val_size), 'v');
+        requests.push_back({
+            "SET " + std::to_string(key.size()) + " " + key + " " +
+                std::to_string(value.size()) + " " + value + "\n",
+            "GET " + std::to_string(key.size()) + " " + key + "\n",
+            "$" + std::to_string(value.size()) + " " + value + "\n"
+        });
     }
-    return true;
+    return requests;
 }
-
-// ── Benchmark orchestration ───────────────────────────────────────────────────
 
 static BenchResult run_benchmark(const BenchConfig& cfg) {
-    // Build the result name shown in the output table.
-    std::string name;
-    if (cfg.workload == "mixed") {
-        name = "MIXED 50/50 (" + std::to_string(cfg.threads) + " thread"
-             + (cfg.threads > 1 ? "s" : "") + ")";
-    } else {
-        std::string label = (cfg.workload == "set") ? "SET" : "GET";
-        name = label + " (" + std::to_string(cfg.threads) + " thread"
-             + (cfg.threads > 1 ? "s" : "") + ", pipeline="
-             + std::to_string(cfg.pipeline) + ")";
+    BenchResult result;
+    const auto requests = make_requests(cfg);
+    // All workloads use the same preloaded keyspace: SET measures updates.
+    int preload_fd = open_connection(cfg);
+    if (preload_fd < 0) { result.setup_errors = 1; return result; }
+    for (const auto& request : requests) {
+        if (exchange(preload_fd, request, true) != Outcome::success) {
+            ::close(preload_fd);
+            result.setup_errors = 1;
+            return result;
+        }
     }
+    ::close(preload_fd);
 
-    int ops_per_thread = cfg.ops / cfg.threads;
-
-    std::vector<ThreadState>  thread_states(static_cast<size_t>(cfg.threads));
-    std::atomic<int>          ready_count{0};
-    std::atomic<bool>         go{false};
-
+    std::vector<ThreadState> states(static_cast<size_t>(cfg.threads));
     std::vector<std::thread> threads;
-    threads.reserve(static_cast<size_t>(cfg.threads));
-
+    std::mutex mutex;
+    std::condition_variable ready_cv, go_cv;
+    int ready = 0;
+    bool go = false, abort = false;
+    BenchClock::time_point deadline;
     for (int t = 0; t < cfg.threads; ++t) {
         threads.emplace_back([&, t]() {
-            auto& state  = thread_states[static_cast<size_t>(t)];
-            int key_base = t * ops_per_thread;
-
-            int fd = open_connection(cfg.host, cfg.port);
-            if (fd < 0) {
-                state.errors    = ops_per_thread;
-                state.total_ops = ops_per_thread;
-                ready_count.fetch_add(1, std::memory_order_release);
-                return;
+            auto& state = states[static_cast<size_t>(t)];
+            const int fd = open_connection(cfg);
+            if (fd < 0) ++state.setup_errors;
+            auto execute = [&](uint64_t index) {
+                const auto key_index = (static_cast<uint64_t>(t) + index * cfg.threads) % requests.size();
+                const bool is_set = cfg.workload == "set" || (cfg.workload == "mixed" && index % 2 == 0);
+                return exchange(fd, requests[key_index], is_set);
+            };
+            if (fd >= 0) {
+                for (int i = 0; i < cfg.warmup_ops; ++i) {
+                    if (execute(static_cast<uint64_t>(i)) != Outcome::success) {
+                        ++state.setup_errors;
+                        break;
+                    }
+                }
             }
-
-            // Pre-populate keys for get / readonly (untimed, pipeline=1 for safety).
-            if (cfg.workload == "get" || cfg.workload == "readonly") {
-                BenchConfig pop = cfg;
-                pop.workload    = "set";
-                pop.pipeline    = 1;
-                ThreadState dummy;
-                run_ops(fd, pop, key_base, ops_per_thread, false, dummy);
+            {
+                std::unique_lock lock(mutex);
+                abort = abort || state.setup_errors != 0;
+                ++ready;
+                ready_cv.notify_one();
+                go_cv.wait(lock, [&]() { return go; });
+                if (abort) { if (fd >= 0) ::close(fd); return; }
             }
-
-            // Warmup phase — same workload, not recorded.
-            if (cfg.warmup_ops > 0) {
-                ThreadState dummy;
-                run_ops(fd, cfg, key_base,
-                        std::min(cfg.warmup_ops, ops_per_thread),
-                        false, dummy);
+            // Distribute the remainder, so --ops is never silently rounded down.
+            const uint64_t count = static_cast<uint64_t>(cfg.ops / cfg.threads +
+                                                        (t < cfg.ops % cfg.threads));
+            for (uint64_t i = 0; ; ++i) {
+                if (cfg.duration_seconds > 0 ? BenchClock::now() >= deadline : i >= count) break;
+                ++state.attempted;
+                const auto start = BenchClock::now();
+                const Outcome outcome = execute(i);
+                const auto elapsed = duration_cast<nanoseconds>(BenchClock::now() - start);
+                if (outcome == Outcome::success) {
+                    ++state.successful;
+                    state.stats.record(elapsed);
+                } else if (outcome == Outcome::server_error) {
+                    ++state.server_errors;
+                } else {
+                    if (outcome == Outcome::transport_error) ++state.transport_errors;
+                    else ++state.protocol_errors;
+                    // Never reuse a stream after a timeout, truncation, or malformed reply.
+                    break;
+                }
             }
-
-            // Signal ready and spin-wait for the go flag.
-            ready_count.fetch_add(1, std::memory_order_release);
-            while (!go.load(std::memory_order_acquire))
-                std::this_thread::yield();
-
-            // Timed benchmark phase.
-            size_t sample_count = static_cast<size_t>(
-                (ops_per_thread + cfg.pipeline - 1) / cfg.pipeline);
-            state.stats.reserve(sample_count);
-            run_ops(fd, cfg, key_base, ops_per_thread, true, state);
-
-            close(fd);
+            ::close(fd);
         });
     }
 
-    // Wait until all threads are ready, then start the clock and fire.
-    while (ready_count.load(std::memory_order_acquire) < cfg.threads)
-        std::this_thread::yield();
-
-    auto wall_start = high_resolution_clock::now();
-    go.store(true, std::memory_order_release);
-
-    for (auto& th : threads) th.join();
-    auto wall_end = high_resolution_clock::now();
-
-    // Aggregate latency samples and error counts from all threads.
-    Stats combined;
-    combined.reserve(static_cast<size_t>(cfg.ops));
-    int total_errors = 0;
-    int total_ops    = 0;
-    for (auto& s : thread_states) {
-        combined.merge(s.stats);
-        total_errors += s.errors;
-        total_ops    += s.total_ops;
+    BenchClock::time_point start;
+    {
+        std::unique_lock lock(mutex);
+        ready_cv.wait(lock, [&]() { return ready == cfg.threads; });
+        start = BenchClock::now();
+        deadline = start + duration_cast<BenchClock::duration>(duration<double>(cfg.duration_seconds));
+        go = true;
+        go_cv.notify_all();
     }
-
-    double elapsed_s = duration_cast<microseconds>(wall_end - wall_start).count() / 1e6;
-    int    measured  = ops_per_thread * cfg.threads;
-
-    return {
-        name,
-        measured / elapsed_s,
-        combined.mean_us(),
-        combined.percentile(50),
-        combined.percentile(99),
-        combined.percentile(99'9),
-        total_errors,
-        total_ops
-    };
-}
-
-// ── Output (matches bench_storage.cpp column layout exactly) ──────────────────
-
-static void print_header() {
-    std::cout << "\n";
-    std::cout << std::left
-              << std::setw(34) << "Benchmark"
-              << std::right
-              << std::setw(14) << "Throughput"
-              << std::setw(13) << "Mean"
-              << std::setw(13) << "P50"
-              << std::setw(13) << "P99"
-              << std::setw(13) << "P99.9"
-              << "\n";
-    std::cout << std::string(100, '-') << "\n";
-}
-
-static void print_result(const BenchResult& r) {
-    auto fmt_ops = [](double ops) -> std::string {
-        std::ostringstream oss;
-        if (ops >= 1e6)      oss << std::fixed << std::setprecision(2) << ops / 1e6 << " Mops/s";
-        else if (ops >= 1e3) oss << std::fixed << std::setprecision(2) << ops / 1e3 << " Kops/s";
-        else                 oss << std::fixed << std::setprecision(0) << ops << " ops/s";
-        return oss.str();
-    };
-    auto fmt_us = [](double us) -> std::string {
-        std::ostringstream oss;
-        oss << std::fixed << std::setprecision(2) << us << " µs";
-        return oss.str();
-    };
-
-    std::cout << std::left  << std::setw(34) << r.name
-              << std::right << std::setw(14) << fmt_ops(r.ops_per_sec)
-              << std::setw(13) << fmt_us(r.mean_us)
-              << std::setw(13) << fmt_us(r.p50_us)
-              << std::setw(13) << fmt_us(r.p99_us)
-              << std::setw(13) << fmt_us(r.p999_us)
-              << "\n";
-    if (r.errors > 0) {
-        std::cout << "  Errors: " << r.errors << " / " << r.total_ops << " ops\n";
+    for (auto& thread : threads) thread.join();
+    result.elapsed_seconds = duration<double>(BenchClock::now() - start).count();
+    for (const auto& state : states) {
+        result.stats.merge(state.stats);
+        result.attempted += state.attempted;
+        result.successful += state.successful;
+        result.server_errors += state.server_errors;
+        result.protocol_errors += state.protocol_errors;
+        result.transport_errors += state.transport_errors;
+        result.setup_errors += state.setup_errors;
     }
+    if (result.elapsed_seconds > 0)
+        result.success_ops_per_sec = result.successful / result.elapsed_seconds;
+    result.p50_us = result.stats.percentile(50);
+    result.p95_us = result.stats.percentile(95);
+    result.p99_us = result.stats.percentile(99);
+    result.p999_us = result.stats.percentile(99.9);
+    result.valid = result.setup_errors == 0 && result.attempted == result.successful &&
+        result.successful > 0 && (cfg.duration_seconds > 0 || result.attempted == static_cast<uint64_t>(cfg.ops));
+    return result;
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+static void print_json(const BenchConfig& cfg, const BenchResult& result) {
+    std::cout << std::setprecision(12)
+        << "{\"schema_version\":1,\"valid\":" << (result.valid ? "true" : "false")
+        << ",\"workload\":\"" << cfg.workload << "\",\"threads\":" << cfg.threads
+        << ",\"keys\":" << cfg.keys << ",\"key_size\":" << cfg.key_size
+        << ",\"val_size\":" << cfg.val_size << ",\"pipeline\":1"
+        << ",\"warmup_ops_per_client\":" << cfg.warmup_ops
+        << ",\"requested_ops\":" << cfg.ops << ",\"requested_duration_seconds\":" << cfg.duration_seconds
+        << ",\"attempted\":" << result.attempted << ",\"successful\":" << result.successful
+        << ",\"server_errors\":" << result.server_errors << ",\"protocol_errors\":" << result.protocol_errors
+        << ",\"transport_errors\":" << result.transport_errors << ",\"setup_errors\":" << result.setup_errors
+        << ",\"errors\":" << result.server_errors + result.protocol_errors + result.transport_errors
+        << ",\"latency_samples\":" << result.stats.latencies_ns.size()
+        << ",\"elapsed_seconds\":" << result.elapsed_seconds
+        << ",\"success_ops_per_sec\":" << result.success_ops_per_sec
+        << ",\"p50_us\":" << result.p50_us << ",\"p95_us\":" << result.p95_us
+        << ",\"p99_us\":" << result.p99_us << ",\"p999_us\":" << result.p999_us << "}\n";
+}
+
+static int parse_int(const std::string& text) {
+    size_t end = 0;
+    const int result = std::stoi(text, &end);
+    if (end != text.size()) throw std::invalid_argument("invalid integer: " + text);
+    return result;
+}
 
 int main(int argc, char* argv[]) {
+    std::signal(SIGPIPE, SIG_IGN);
     BenchConfig cfg;
-
-    for (int i = 1; i < argc; ++i) {
-        if      (std::strcmp(argv[i], "--host")        == 0 && i + 1 < argc)
-            cfg.host       = argv[++i];
-        else if (std::strcmp(argv[i], "--port")        == 0 && i + 1 < argc)
-            cfg.port       = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--ops")         == 0 && i + 1 < argc)
-            cfg.ops        = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--threads")     == 0 && i + 1 < argc)
-            cfg.threads    = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--pipeline")    == 0 && i + 1 < argc)
-            cfg.pipeline   = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--key-size")    == 0 && i + 1 < argc)
-            cfg.key_size   = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--val-size")    == 0 && i + 1 < argc)
-            cfg.val_size   = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--workload")    == 0 && i + 1 < argc)
-            cfg.workload   = argv[++i];
-        else if (std::strcmp(argv[i], "--warmup-ops")  == 0 && i + 1 < argc)
-            cfg.warmup_ops = std::atoi(argv[++i]);
+    try {
+        for (int i = 1; i < argc; ++i) {
+            const std::string flag = argv[i];
+            if (flag == "--json") { cfg.json = true; continue; }
+            if (flag == "--help") {
+                std::cout << "bench_cluster [--host IPv4] [--port N] [--workload set|get|mixed|readonly]\n"
+                    "  [--ops N | --duration-seconds S] [--threads N] [--keys N]\n"
+                    "  [--key-size N] [--val-size N] [--warmup-ops N] [--pipeline 1] [--json]\n"
+                    "Preloads a fixed keyspace. SET updates existing keys. Warmup is per client.\n"
+                    "Latency quantiles cover successful requests; throughput excludes errors.\n";
+                return 0;
+            }
+            if (i + 1 == argc) throw std::invalid_argument("missing value for " + flag);
+            const std::string value = argv[++i];
+            if (flag == "--host") cfg.host = value;
+            else if (flag == "--port") cfg.port = parse_int(value);
+            else if (flag == "--ops") cfg.ops = parse_int(value);
+            else if (flag == "--threads") cfg.threads = parse_int(value);
+            else if (flag == "--keys") cfg.keys = parse_int(value);
+            else if (flag == "--key-size") cfg.key_size = parse_int(value);
+            else if (flag == "--val-size") cfg.val_size = parse_int(value);
+            else if (flag == "--warmup-ops") cfg.warmup_ops = parse_int(value);
+            else if (flag == "--workload") cfg.workload = value;
+            else if (flag == "--pipeline") {
+                if (parse_int(value) != 1)
+                    throw std::invalid_argument("only --pipeline 1 is supported: server reply ordering is not guaranteed");
+            } else if (flag == "--duration-seconds") {
+                size_t end = 0;
+                cfg.duration_seconds = std::stod(value, &end);
+                if (end != value.size() || !std::isfinite(cfg.duration_seconds) || cfg.duration_seconds <= 0)
+                    throw std::invalid_argument("duration must be positive and finite");
+            } else throw std::invalid_argument("unknown option: " + flag);
+        }
+        if (cfg.workload == "readonly") cfg.workload = "get";
+        if (cfg.workload != "set" && cfg.workload != "get" && cfg.workload != "mixed")
+            throw std::invalid_argument("workload must be set, get, or mixed");
+        if (cfg.port < 1 || cfg.port > 65535 || cfg.threads < 1 || cfg.ops < 1 ||
+            cfg.keys < 1 || cfg.val_size < 1 || cfg.val_size > 16 * 1024 * 1024 ||
+            cfg.key_size < 4 + static_cast<int>(std::to_string(cfg.keys - 1).size()) ||
+            cfg.key_size > 1024 || cfg.warmup_ops < 0)
+            throw std::invalid_argument("invalid size/count; keys must fit without truncation");
+        in_addr address{};
+        if (::inet_pton(AF_INET, cfg.host.c_str(), &address) != 1)
+            throw std::invalid_argument("host must be an IPv4 address");
+    } catch (const std::exception& error) {
+        std::cerr << "benchmark: " << error.what() << '\n';
+        return 2;
     }
-
-    if (cfg.threads  < 1) cfg.threads  = 1;
-    if (cfg.ops      < 1) cfg.ops      = 1;
-    if (cfg.pipeline < 1) cfg.pipeline = 1;
-
-    std::cout << "DKV Cluster Benchmark\n";
-    std::cout << "  target="   << cfg.host << ":" << cfg.port
-              << "  ops="      << cfg.ops
-              << "  threads="  << cfg.threads
-              << "  pipeline=" << cfg.pipeline
-              << "  key_size=" << cfg.key_size << "B"
-              << "  val_size=" << cfg.val_size << "B"
-              << "  workload=" << cfg.workload << "\n";
-
-    print_header();
-    BenchResult result = run_benchmark(cfg);
-    print_result(result);
-    std::cout << std::string(100, '-') << "\n";
-
-    return 0;
+    const BenchResult result = run_benchmark(cfg);
+    if (cfg.json) print_json(cfg, result);
+    else {
+        std::cout << std::fixed << std::setprecision(2)
+            << "Workload: " << cfg.workload << ", clients: " << cfg.threads << ", keys: " << cfg.keys << '\n'
+            << "Successful: " << result.successful << " / attempted: " << result.attempted
+            << ", setup errors: " << result.setup_errors << '\n'
+            << "Errors (server/protocol/transport): " << result.server_errors << '/'
+            << result.protocol_errors << '/' << result.transport_errors << '\n'
+            << "Successful ops/s: " << result.success_ops_per_sec << '\n'
+            << "Successful-request latency (us): p50=" << result.p50_us << " p95=" << result.p95_us
+            << " p99=" << result.p99_us << " p99.9=" << result.p999_us << '\n';
+    }
+    return result.valid ? 0 : 1;
 }

@@ -121,6 +121,10 @@ add_executable(bench_cluster
 target_link_libraries(bench_cluster PRIVATE pthread)
 target_include_directories(bench_cluster PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+add_executable(dkv_benchmark_tests tests/unit/test_bench_cluster.cpp)
+target_link_libraries(dkv_benchmark_tests PRIVATE GTest::gtest_main pthread)
+gtest_discover_tests(dkv_benchmark_tests)
+
 # ── CLI Client ───────────────────────────────────────────────────────────────
 add_executable(dkv_cli
     tools/dkv_cli.cpp
